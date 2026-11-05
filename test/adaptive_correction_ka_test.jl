@@ -252,6 +252,14 @@ end
     δn = Inti.adaptive_correction(plan32, [q.coords + 1.0e-6 * q.normal])
     @test nnz(δn) > 0
     @test_throws ArgumentError Inti.adaptive_correction(plan32, [q.coords])
+    # processing the pairs sorted by cost (default on GPUs) gives the same result
+    keys, npairs = Ext._nearfield_keys(plan, Xd)
+    c0, v0, n0 = Ext._nearfield_values(plan, Xd, keys, npairs; sort_by_cost = false)
+    c1, v1, n1 = Ext._nearfield_values(plan, Xd, keys, npairs; sort_by_cost = true)
+    @test c0 == c1 && v0 == v1 && n0 == n1
+    # default bound on the number of subdivisions depends on the precision
+    @test Ext._val(plan.maxsubdiv) == 64
+    @test Ext._val(Inti.adaptive_correction_plan(laplace_sl, Q; backend = CPU(), maxdist = 3h, rtol = 1.0e-8).maxsubdiv) == 256
     # targets far away: empty correction
     δ0 = Inti.adaptive_correction(plan, [(coords = SVector(10.0, 10.0), normal = SVector(1.0, 0.0))])
     @test nnz(δ0) == 0 && size(δ0) == (1, length(Q))

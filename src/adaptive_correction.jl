@@ -139,9 +139,13 @@ The parameters `maxdist`, `rtol` and `atol` have the same meaning as in
 [`adaptive_correction`](@ref). The integrals are computed by reproducing the adaptive
 quadrature of the default path (same embedded rule, subdivision, and stopping criterion), in
 precision `T` (e.g. `T = Float32` for backends without `Float64` support). The keyword
-`maxsubdiv` bounds the number of subdivisions per interaction; if the requested tolerance is
-not met within it, an error is thrown. Tolerances that cannot be achieved in precision `T`
-are rejected.
+`maxsubdiv` bounds the number of subdivisions per interaction (by default `64` for
+`T = Float32` and `256` otherwise; larger values increase the memory used by each GPU thread);
+if the requested tolerance is not met within it, an error is thrown. Tolerances that cannot
+be achieved in precision `T` are rejected.
+
+In precision `T`, the relative accuracy of the interaction between a target at distance `d`
+from an element of size `h` is limited to about `eps(T) * h / d`.
 
 The targets `X` may be given in a higher precision than `T`: the target coordinates relative
 to each element are computed in that precision before being rounded to `T`.

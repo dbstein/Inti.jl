@@ -15,6 +15,9 @@
     targets are off-surface points at distances `d ∈ [1e-2 h, h]` (log-uniform) from the
     boundary, two per boundary quadrature node (one on each side).
 
+    Variants are labeled by backend, precision `T` of the integration, and precision of the
+    targets `X` (Float64 whenever the backend supports it).
+
     Timed stages (seconds; minimum over repetitions):
     - plan:   one-time setup for the (fixed) source geometry, including transfer to the device
     - h2d:    transfer of the targets to the device (only if they live on the host)
@@ -93,9 +96,9 @@ function besttime(f, n)
     return minimum(_ -> @elapsed(f()), 1:n)
 end
 
-function device_stages(K, Q, X, maxdist, rtol, atol, backend, T, maxsubdiv, nrep)
+function device_stages(K, Q, X, maxdist, rtol, atol, backend, T, nrep)
     sync(x) = (KernelAbstractions.synchronize(backend); x)
-    mkplan = () -> Inti.adaptive_correction_plan(K, Q; backend, T, maxdist, rtol, atol, maxsubdiv)
+    mkplan = () -> Inti.adaptive_correction_plan(K, Q; backend, T, maxdist, rtol, atol)
     tplan = besttime(() -> sync(mkplan()), 1)
     plan = mkplan()
     # targets in the precision of the plan's centers (Float64 if supported by the backend)
@@ -133,14 +136,14 @@ end
 const COLUMNS = (:plan, :h2d, :search, :csr, :kernel, :check, :step, :d2h, :mul)
 
 function header()
-    @printf("%-11s %-17s %-6s %8s |", "kernel", "variant", "rtol", "pairs")
+    @printf("%-11s %-19s %-6s %8s |", "kernel", "variant", "rtol", "pairs")
     foreach(c -> @printf(" %8s", c), COLUMNS)
     @printf(" | %8s %5s\n", "error", "nsub")
-    return println("-"^(48 + 9 * length(COLUMNS) + 17))
+    return println("-"^(50 + 9 * length(COLUMNS) + 17))
 end
 
 function row(kname, variant, rtol, npairs, t, err, nsub)
-    @printf("%-11s %-17s %-6s %8d |", kname, variant, @sprintf("%.0e", rtol), npairs)
+    @printf("%-11s %-19s %-6s %8d |", kname, variant, @sprintf("%.0e", rtol), npairs)
     foreach(c -> @printf(" %8s", haskey(t, c) ? @sprintf("%.2e", t[c]) : "—"), COLUMNS)
     return @printf(" | %8.1e %5.1f\n", err, nsub)
 end
@@ -178,22 +181,22 @@ function run_benchmark(; meshsizes, nrep = 3, maxdist_factor = 3)
                     mul = besttime(() -> δ * σ, max(nrep, 10)),
                 )
                 row(kname, "Inti (threads)", rtol, npairs, t, entry_error(δ, δref), NaN)
-                variants = Any[("KA POCL F64", CPU(), Float64, 256)]
-                if KernelAbstractions.supports_float64(gpu)
-                    push!(variants, ("KA $gpu_name F64", gpu, Float64, 256))
-                end
+                variants = Any[("POCL", CPU(), Float64)]
+                KernelAbstractions.supports_float64(gpu) && push!(variants, (gpu_name, gpu, Float64))
                 if rtol ≥ 1.0e-5
-                    push!(variants, ("KA POCL F32", CPU(), Float32, 256))
-                    push!(variants, ("KA $gpu_name F32", gpu, Float32, 256))
-                    push!(variants, ("KA $gpu_name F32/64", gpu, Float32, 64))
+                    push!(variants, ("POCL", CPU(), Float32))
+                    push!(variants, (gpu_name, gpu, Float32))
                 end
-                for (vname, backend, T, maxsubdiv) in variants
+                for (bname, backend, T) in variants
+                    # targets are given in Float64 when the backend supports it
+                    X_T = KernelAbstractions.supports_float64(backend) ? 64 : 32
+                    vname = "$bname T=F$(8sizeof(T)) X=F$X_T"
                     try
-                        t, δ, nsub = device_stages(K, Q, X, maxdist, rtol, atol, backend, T, maxsubdiv, nrep)
+                        t, δ, nsub = device_stages(K, Q, X, maxdist, rtol, atol, backend, T, nrep)
                         row(kname, vname, rtol, npairs, t, entry_error(δ, δref), nsub)
                     catch err
                         msg = (s = sprint(showerror, err); r = findfirst("Reason", s); isnothing(r) ? first(split(s, "\n")) : s[first(r):min(end, first(r) + 300)])
-                        @printf("%-11s %-17s %-6s   FAILED: %s\n", kname, vname, @sprintf("%.0e", rtol), msg)
+                        @printf("%-11s %-19s %-6s   FAILED: %s\n", kname, vname, @sprintf("%.0e", rtol), msg)
                     end
                 end
             end

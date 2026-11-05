@@ -22,7 +22,13 @@ end
 # each interaction; tolerances that are not met are reported a posteriori.
 const RTOL_FLOOR_FACTOR = 64
 
-const DEFAULT_MAXSUBDIV = 256
+# Default bound on the number of subdivisions per interaction. The per-thread storage grows
+# with it, which slows down the kernel on GPUs. In `Float32`, attainable tolerances were met
+# with at most ~40 subdivisions in our tests (hypersingular kernel, targets at 1e-2 h from the
+# boundary), and closer targets are limited by rounding (relative error ≈ eps(T) h / d) rather
+# than by the number of subdivisions.
+default_maxsubdiv(::Type{Float32}) = 64
+default_maxsubdiv(::Type) = 256
 
 function _check_precision(backend, ::Type{T}, rtol, atol) where {T}
     if T == Float64 && !KA.supports_float64(backend)
@@ -79,7 +85,7 @@ _val(::Val{N}) where {N} = N
 
 function Inti._adaptive_correction_plan(K, Y, backend, ::Type{T}, maxdist, rtol, atol, maxsubdiv) where {T}
     _check_precision(backend, T, rtol, atol)
-    maxsubdiv = something(maxsubdiv, DEFAULT_MAXSUBDIV)
+    maxsubdiv = something(maxsubdiv, default_maxsubdiv(T))
     Kd = _convert_kernel(K, T)
     isbits(Kd) || throw(ArgumentError("kernel $K is not isbits"))
     msh = Inti.mesh(Y)
@@ -457,13 +463,43 @@ function _csr_rowptr(plan::AdaptiveCorrectionPlan, keys, npairs, m)
     return rowptr
 end
 
-@kernel function _nearfield_correction_kernel!(
-        nzval, colval, nsub, @Const(keys), @Const(X), @Const(els), @Const(offsets),
-        @Const(oris), @Const(ynodes), @Const(wnodes), @Const(el2qtags),
-        K, L, rule, rtol, atol, maxsubdiv,
-    )
+# Proxy for the cost of the adaptive integration of pair `p`: distance from the target to the
+# closest quadrature node, relative to the extent of the element's quadrature nodes. The
+# number of subdivisions grows as this ratio decreases.
+@kernel function _pair_cost_kernel!(cost, @Const(keys), @Const(X), @Const(offsets), @Const(ynodes))
     p = @index(Global, Linear)
     @inbounds begin
+        i, n = _pair_from_key(keys[p])
+        T = eltype(cost)
+        x = _local_target(T, X[i], offsets[n]).coords
+        np = size(ynodes, 1)
+        dmin = typemax(T)
+        for k in 1:np
+            dmin = min(dmin, norm(x - ynodes[k, n].coords))
+        end
+        cost[p] = dmin / norm(ynodes[np, n].coords - ynodes[1, n].coords)
+    end
+end
+
+# Permutation grouping pairs of similar cost, so that the work-items executed in lockstep on a
+# GPU (warps, SIMD groups) perform similar numbers of subdivisions.
+function _cost_order(plan::AdaptiveCorrectionPlan, X, keys, npairs)
+    backend = plan.backend
+    cost = KA.allocate(backend, _float_type(plan), npairs)
+    _pair_cost_kernel!(backend)(cost, keys, X, plan.offsets, plan.ynodes; ndrange = npairs)
+    perm = KA.allocate(backend, Int32, npairs)
+    AK.sortperm!(perm, cost)
+    return perm
+end
+
+@kernel function _nearfield_correction_kernel!(
+        nzval, colval, nsub, @Const(perm), @Const(keys), @Const(X), @Const(els),
+        @Const(offsets), @Const(oris), @Const(ynodes), @Const(wnodes), @Const(el2qtags),
+        K, L, rule, rtol, atol, maxsubdiv,
+    )
+    t = @index(Global, Linear)
+    @inbounds begin
+        p = isnothing(perm) ? t : Int(perm[t])
         i, n = _pair_from_key(keys[p])
         T = typeof(rtol)
         x = _local_target(T, X[i], offsets[n])
@@ -491,12 +527,18 @@ end
 end
 
 """
-    _nearfield_values(plan, X, keys, npairs; workgroupsize = nothing)
+    _nearfield_values(plan, X, keys, npairs; sort_by_cost, workgroupsize = nothing)
 
 Compute the values (and column indices) of the CSR correction matrix, together with the
-number of subdivisions used for each pair.
+number of subdivisions used for each pair. If `sort_by_cost`, the pairs are processed in the
+order given by [`_cost_order`](@ref). This is the default on GPUs, where it reduces the
+divergence between work-items executed in lockstep; on the CPU backend the original order
+(pairs of the same target and neighboring elements are adjacent) is more cache-friendly.
 """
-function _nearfield_values(plan::AdaptiveCorrectionPlan, X, keys, npairs; workgroupsize = nothing)
+function _nearfield_values(
+        plan::AdaptiveCorrectionPlan, X, keys, npairs;
+        sort_by_cost = !(plan.backend isa typeof(KA.CPU())), workgroupsize = nothing,
+    )
     backend = plan.backend
     np = size(plan.el2qtags, 1)
     T = _float_type(plan)
@@ -511,8 +553,9 @@ function _nearfield_values(plan::AdaptiveCorrectionPlan, X, keys, npairs; workgr
     else
         _nearfield_correction_kernel!(backend, workgroupsize)
     end
+    perm = sort_by_cost ? _cost_order(plan, X, keys, npairs) : nothing
     kernel!(
-        nzval, colval, nsub, keys, X, plan.els, plan.offsets, plan.oris, plan.ynodes,
+        nzval, colval, nsub, perm, keys, X, plan.els, plan.offsets, plan.oris, plan.ynodes,
         plan.wnodes, plan.el2qtags, plan.kernel, plan.basis, plan.rule, plan.rtol, plan.atol,
         plan.maxsubdiv; ndrange = npairs,
     )
