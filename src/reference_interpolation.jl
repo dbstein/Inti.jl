@@ -433,13 +433,21 @@ end
     # fetch references nodes on format expected by `lagrange_interp`
     nodes1d = n == 1 ? [0.5] : collect(range(0, 1, n))
     weights1d = barycentric_lagrange_weights(nodes1d)
-    nodes = ntuple(i -> nodes1d, D)
-    weights = ntuple(i -> weights1d, D)
+    # splice isbits tuples (not vectors) so that the generated code is GPU-compatible
+    nodes = ntuple(i -> Tuple(nodes1d), D)
+    weights = ntuple(i -> Tuple(weights1d), D)
     return quote
         v = reshape(vals(el), $dims)
-        return tensor_lagrange_interp(SVector(u), v, $nodes, $weights, Val(D), 1, Np)
+        # interpolate in the scalar type of the element (e.g. avoid `Float64` on `Float32`
+        # elements)
+        R = float(real(eltype(eltype(v))))
+        nodes = _convert_tuples(R, $nodes)
+        weights = _convert_tuples(R, $weights)
+        return tensor_lagrange_interp(SVector(u), v, nodes, weights, Val(D), 1, Np)
     end
 end
+
+_convert_tuples(::Type{R}, t::Tuple) where {R} = map(x -> map(R, x), t)
 
 """
     tensor_lagrange_interp(
@@ -492,7 +500,7 @@ function at the point `x`.
     # slightly different representation, which is more stable, if `x` is ever close to an
     # interpolation node. The `thres` variable below was chosen empirically for `Float64`
     # types.
-    thres = 1.0e-3
+    thres = oftype(first(X), 1.0e-3)
     if dim == 1
         for i in 1:n
             @inbounds ci = vals[i1 + (i - 1)]

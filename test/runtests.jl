@@ -36,6 +36,8 @@ using Aqua
     include("volume_potential_test.jl")
 end
 
+@safetestset "Adaptive correction (KernelAbstractions)" include("adaptive_correction_ka_test.jl")
+
 @testset "Accelerated density interpolation" include("dim_test.jl")
 
 @safetestset "Gmsh extension" include("gmsh_test.jl")

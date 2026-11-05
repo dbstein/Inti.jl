@@ -60,6 +60,24 @@ This will use an adaptive quadrature rule for the nearfield and fixed Gauss-Lege
 quadrature rules for the radial and angular directions when computing the singular
 correction in polar coordinates on the reference domain. You can then call
 `adaptive_correction(iop, maxdist, quads_dict)` to use the custom quadrature.
+
+# KernelAbstractions backend
+
+Passing a `KernelAbstractions` backend (e.g. `backend = CPU()` or `backend =
+MetalBackend()`) computes the nearly-singular corrections with a device kernel that
+reproduces the adaptive quadrature of the default path (same embedded rule, subdivision,
+and stopping criterion). This requires loading `KernelAbstractions`, and currently
+supports only:
+
+- source meshes of line elements (two-dimensional problems);
+- nearly-singular interactions, i.e. no target may coincide with a source quadrature node
+  (an `ArgumentError` is thrown otherwise);
+- `LagrangeElement`s for `T ≠ Float64`, where `T` is the floating point type used on the
+  device (e.g. `T = Float32` for backends without `Float64` support).
+
+The keyword `maxsubdiv` bounds the number of subdivisions per interaction; if the requested
+tolerance is not met within it, an error is thrown. Tolerances that cannot be achieved in
+precision `T` are rejected.
 """
 function adaptive_correction(
         iop::IntegralOperator;
@@ -67,6 +85,8 @@ function adaptive_correction(
         rtol = nothing,
         atol = nothing,
         threads = true,
+        backend = nothing,
+        T = Float64,
         kwargs...,
     )
     # check if we need to compute a tolerance and/or a maxdist
@@ -78,6 +98,10 @@ function adaptive_correction(
     maxdist = isnothing(maxdist) ? maxdist_ : maxdist
     rtol = isnothing(rtol) ? (hastol ? 0.0 : rtol_) : rtol
     atol = isnothing(atol) ? (hastol ? 0.0 : atol_) : atol
+    if !isnothing(backend)
+        return _adaptive_correction_ka(iop, maxdist, rtol, atol, backend, T, threads; kwargs...)
+    end
+    T == Float64 || throw(ArgumentError("`T` is only supported together with a `backend`"))
     # go on and compute the correction
     msh = mesh(source(iop))
     quads_dict = OrderedDict()
@@ -91,6 +115,12 @@ function adaptive_correction(
         quads_dict[E] = quads
     end
     return adaptive_correction(iop, maxdist, quads_dict, threads)
+end
+
+function _adaptive_correction_ka(args...; kwargs...)
+    return error(
+        "_adaptive_correction_ka not found. Did you forget to import KernelAbstractions?",
+    )
 end
 
 function adaptive_correction(iop, maxdist, quads_dict::OrderedDict, threads = true)
