@@ -4,7 +4,8 @@
         julia --project=benchmark -t 8 benchmark/diagnose_cuda.jl [stage]
 
     with `stage` one of `kernels`, `pocl32`, `pocl64`, `cuda64`, `cuda32`, or one of the minimal
-    POCL (CPU backend) checks `panels32`, `panels64`, `simplex32`, `rule32` (default: `kernels`).
+    POCL (CPU backend) checks `panels32`, `panels64`, `simplex32`, `rule32`, `map32`, `apply32`,
+    `apply32_fields`, `rule32_fields` (default: `kernels`).
     Each stage prints a line before starting, so that a crash can be located. For the
     correction stages, the following environment variables can be set:
     - `INTI_DIAG_DIM=2`: ellipse (line elements) instead of a sphere
@@ -186,7 +187,68 @@ function check_rule()
     return say("  ok, sum = ", sum(out))
 end
 
-if stage == "panels32"
+# 4. finer checks of `rule32`: the map of a Float32 triangle, one application of the rule, and
+# passing the rule as a kernel argument (whole struct, or field by field)
+@kernel function map_kernel!(out, dom)
+    i = @index(Global, Linear)
+    Φ, μ = HAI.map_from_reference(dom)
+    @inbounds out[i] = sum(Φ(SVector(0.3f0, 0.2f0))) + μ + i
+end
+
+function check_map()
+    dom = Ext._hadaptive_domain(Inti.ReferenceTriangle(), Float32)
+    out = KA.allocate(CPU(), Float32, 10_000)
+    map_kernel!(CPU())(out, dom; ndrange = length(out))
+    KA.synchronize(CPU())
+    return say("  ok, sum = ", sum(out))
+end
+
+const f_simple = u -> SVector(1 / ((u[1] - 0.3f0)^2 + (u[2] - 0.2f0)^2 + 1.0f-3), u[1] * u[2])
+
+@kernel function apply_kernel!(out, rule)
+    i = @index(Global, Linear)
+    I, E = Ext._apply_rule(f_simple, rule, rule.domain)
+    @inbounds out[i] = I[1] + E + i
+end
+
+@kernel function apply_fields_kernel!(out, nodes, wh, wl, dom)
+    i = @index(Global, Linear)
+    rule = Ext.EmbeddedRule(nodes, wh, wl, dom)
+    I, E = Ext._apply_rule(f_simple, rule, rule.domain)
+    @inbounds out[i] = I[1] + E + i
+end
+
+@kernel function rule_fields_kernel!(out, nodes, wh, wl, dom)
+    i = @index(Global, Linear)
+    rule = Ext.EmbeddedRule(nodes, wh, wl, dom)
+    I, nsub, converged = Ext._adaptive_integrate(f_simple, rule, 1.0f-5, 0.0f0, Val(16))
+    @inbounds out[i] = I[1] + nsub
+end
+
+function check_apply(how)
+    rule = Ext._embedded_rule(Inti.ReferenceTriangle(), Float32)
+    say("  sizeof(rule) = ", sizeof(rule), ", fields: ", map(f -> (f, sizeof(getfield(rule, f)), fieldoffset(typeof(rule), findfirst(==(f), fieldnames(typeof(rule))))), fieldnames(typeof(rule))))
+    out = KA.allocate(CPU(), Float32, 10_000)
+    if how == :struct
+        apply_kernel!(CPU())(out, rule; ndrange = length(out))
+    elseif how == :fields
+        apply_fields_kernel!(CPU())(out, rule.nodes, rule.weights_high, rule.weights_low, rule.domain; ndrange = length(out))
+    else
+        rule_fields_kernel!(CPU())(out, rule.nodes, rule.weights_high, rule.weights_low, rule.domain; ndrange = length(out))
+    end
+    KA.synchronize(CPU())
+    return say("  ok, sum = ", sum(out))
+end
+
+if stage == "map32"
+    check_map()
+elseif stage == "apply32"
+    check_apply(:struct)
+elseif stage == "apply32_fields"
+    check_apply(:fields)
+elseif stage == "rule32_fields"
+    check_apply(:adaptive)
+elseif stage == "panels32"
     check_panels(Float32)
 elseif stage == "panels64"
     check_panels(Float64)
