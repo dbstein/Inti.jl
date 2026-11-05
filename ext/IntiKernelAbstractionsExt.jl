@@ -588,13 +588,19 @@ end
     return
 end
 
+# The fields of the `EmbeddedRule` are passed to the kernels as separate arguments, and the rule
+# is rebuilt inside the kernel: passing the rule itself as a single argument made the CPU
+# (POCL) backend crash on x86 (Float32, triangles), while passing its fields does not.
+_rule_fields(rule::EmbeddedRule) = (rule.nodes, rule.weights_high, rule.weights_low, rule.domain)
+
 # First tier: panels stored in per-thread arrays of capacity `CAP` (see `_tiers`).
 @kernel function _correction_private_kernel!(
         nzval, colval, nsub, @Const(list), @Const(keys), @Const(X), @Const(els),
         @Const(offsets), @Const(oris), @Const(ynodes), @Const(wnodes), @Const(el2qtags),
-        K, L, rule, rtol, atol, maxsubdiv,
+        K, L, rnodes, rwh, rwl, rdomain, rtol, atol, maxsubdiv,
     )
     t = @index(Global, Linear)
+    rule = EmbeddedRule(rnodes, rwh, rwl, rdomain)
     @inbounds p = isnothing(list) ? t : Int(list[t])
     @inbounds f, x, n = _pair_integrand(keys[p], X, els, offsets, oris, K, L, typeof(rtol))
     W, nb, converged = _adaptive_integrate(f, rule, rtol, atol, maxsubdiv)
@@ -606,9 +612,10 @@ end
 @kernel function _correction_scratch_kernel!(
         nzval, colval, nsub, @Const(list), offset, spanels, sEs, sIs, @Const(keys), @Const(X),
         @Const(els), @Const(offsets), @Const(oris), @Const(ynodes), @Const(wnodes),
-        @Const(el2qtags), K, L, rule, rtol, atol, maxsubdiv, store,
+        @Const(el2qtags), K, L, rnodes, rwh, rwl, rdomain, rtol, atol, maxsubdiv, store,
     )
     t = @index(Global, Linear)
+    rule = EmbeddedRule(rnodes, rwh, rwl, rdomain)
     @inbounds p = Int(list[offset + t])
     @inbounds f, x, n = _pair_integrand(keys[p], X, els, offsets, oris, K, L, typeof(rtol))
     I, E = _apply_rule(f, rule, rule.domain)
@@ -709,7 +716,7 @@ function _nearfield_values(
     npairs == 0 && return colval, nzval, nsub
     args = (
         keys, X, plan.els, plan.offsets, plan.oris, plan.ynodes, plan.wnodes, plan.el2qtags,
-        plan.kernel, plan.basis, plan.rule, plan.rtol, plan.atol,
+        plan.kernel, plan.basis, _rule_fields(plan.rule)..., plan.rtol, plan.atol,
     )
     caps = _tiers(plan, IT; private_bytes)
     # first tier: all pairs, per-thread storage
