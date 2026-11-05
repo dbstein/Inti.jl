@@ -3,7 +3,8 @@
 
         julia --project=benchmark -t 8 benchmark/diagnose_cuda.jl [stage]
 
-    with `stage` one of `kernels`, `pocl32`, `pocl64`, `cuda64`, `cuda32` (default: `kernels`).
+    with `stage` one of `kernels`, `pocl32`, `pocl64`, `cuda64`, `cuda32`, or one of the minimal
+    POCL (CPU backend) checks `panels32`, `panels64`, `simplex32`, `rule32` (default: `kernels`).
     Each stage prints a line before starting, so that a crash can be located. For the
     correction stages, the following environment variables can be set:
     - `INTI_DIAG_DIM=2`: ellipse (line elements) instead of a sphere
@@ -116,7 +117,84 @@ function check_correction(backend, T)
     return
 end
 
-if stage == "kernels"
+# 3. minimal POCL kernels exercising a single feature each (Float32 triangles)
+const HAI = Inti.HAdaptiveIntegration
+
+# per-thread arrays of triangle panels (24 bytes in Float32), filled by subdivision
+@kernel function panels_kernel!(out, ::Val{CAP}, dom₀) where {CAP}
+    i = @index(Global, Linear)
+    DOM = typeof(dom₀)
+    panels = MVector{CAP, DOM}(undef)
+    @inbounds panels[1] = dom₀
+    n = 1
+    @inbounds for k in 1:(CAP ÷ 4)
+        children = HAI.subdivide_triangle(panels[k])
+        panels[k] = children[1]
+        for c in 2:4
+            n += 1
+            panels[n] = children[c]
+        end
+    end
+    acc = zero(eltype(eltype(dom₀.vertices)))
+    @inbounds for k in 1:n
+        acc += sum(sum, panels[k].vertices)
+    end
+    @inbounds out[i] = acc + i
+end
+
+function check_panels(T)
+    dom = Ext._hadaptive_domain(Inti.ReferenceTriangle(), T)
+    out = KA.allocate(CPU(), T, 10_000)
+    panels_kernel!(CPU())(out, Val(16), dom; ndrange = length(out))
+    KA.synchronize(CPU())
+    return say("  ok, sum = ", sum(out))
+end
+
+# Inti's evaluation of a P2 triangle (and its jacobian) in Float32
+@kernel function simplex_kernel!(out, @Const(els), @Const(us))
+    i = @index(Global, Linear)
+    @inbounds el, u = els[i], us[i]
+    @inbounds out[i] = norm(el(u)) + norm(Inti.jacobian(el, u))
+end
+
+function check_simplex()
+    T = Float32
+    n = 10_000
+    E = Inti.LagrangeElement{Inti.ReferenceTriangle, 6, SVector{3, T}}
+    els = [E(SVector(ntuple(_ -> rand(SVector{3, T}), 6))) for _ in 1:n]
+    us = [SVector{2, T}(0.2, 0.3) for _ in 1:n]
+    out = KA.allocate(CPU(), T, n)
+    simplex_kernel!(CPU())(out, els, us; ndrange = n)
+    KA.synchronize(CPU())
+    return say("  ok, max deviation from host = ", maximum(i -> abs(out[i] - (norm(els[i](us[i])) + norm(Inti.jacobian(els[i], us[i])))), 1:n))
+end
+
+# the adaptive integrator on a Float32 triangle, with an elementary integrand
+@kernel function rule_kernel!(out, rule)
+    i = @index(Global, Linear)
+    a = Float32(i) / 10_000
+    f = u -> SVector(1 / ((u[1] - a)^2 + (u[2] - 0.2f0)^2 + 1.0f-3), u[1] * u[2])
+    I, nsub, converged = Ext._adaptive_integrate(f, rule, 1.0f-5, 0.0f0, Val(16))
+    @inbounds out[i] = I[1] + nsub
+end
+
+function check_rule()
+    rule = Ext._embedded_rule(Inti.ReferenceTriangle(), Float32)
+    out = KA.allocate(CPU(), Float32, 10_000)
+    rule_kernel!(CPU())(out, rule; ndrange = length(out))
+    KA.synchronize(CPU())
+    return say("  ok, sum = ", sum(out))
+end
+
+if stage == "panels32"
+    check_panels(Float32)
+elseif stage == "panels64"
+    check_panels(Float64)
+elseif stage == "simplex32"
+    check_simplex()
+elseif stage == "rule32"
+    check_rule()
+elseif stage == "kernels"
     check_kernels()
 elseif stage == "pocl32"
     check_correction(CPU(), Float32)
