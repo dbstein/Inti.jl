@@ -603,7 +603,8 @@ end
         cc += 1
         idxs[cc] = (I..., k - sum(I)) # add the last coordinate
     end
-    return :($idxs)
+    # return an isbits constant (required on GPUs)
+    return :($(SVector(idxs)))
 end
 
 """

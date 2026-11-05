@@ -153,7 +153,7 @@ to each element are computed in that precision before being rounded to `T`.
 Requires loading `KernelAbstractions`, `AcceleratedKernels` and `ImplicitBVH`. Currently
 only supports:
 
-- source meshes with a single type of line elements (two-dimensional problems);
+- boundary meshes with a single type of line (2D), or triangle or quadrilateral (3D) elements;
 - nearly-singular interactions, i.e. no target may coincide with a source quadrature node
   (an `ArgumentError` is thrown otherwise);
 - `LagrangeElement`s for `T ≠ Float64`.

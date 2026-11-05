@@ -22,13 +22,12 @@ end
 # each interaction; tolerances that are not met are reported a posteriori.
 const RTOL_FLOOR_FACTOR = 64
 
-# Default bound on the number of subdivisions per interaction. The per-thread storage grows
-# with it, which slows down the kernel on GPUs. In `Float32`, attainable tolerances were met
-# with at most ~40 subdivisions in our tests (hypersingular kernel, targets at 1e-2 h from the
-# boundary), and closer targets are limited by rounding (relative error ≈ eps(T) h / d) rather
-# than by the number of subdivisions.
-default_maxsubdiv(::Type{Float32}) = 64
-default_maxsubdiv(::Type) = 256
+# Default bound on the number of subdivisions per interaction, for line (2D) and surface (3D)
+# elements. In our tests, at most ~130 (line elements, rtol = 1e-8) and ~950 (surface elements,
+# rtol = 1e-6) subdivisions were needed for targets at 1e-2 h from the boundary. Since the
+# integration is performed in tiers (see `_tiers`), a large bound only costs memory and time
+# for the interactions that need it.
+default_maxsubdiv(ref::Inti.ReferenceShape) = Inti.geometric_dimension(ref) == 1 ? 1024 : 4096
 
 function _check_precision(backend, ::Type{T}, rtol, atol) where {T}
     if T == Float64 && !KA.supports_float64(backend)
@@ -85,23 +84,26 @@ _val(::Val{N}) where {N} = N
 
 function Inti._adaptive_correction_plan(K, Y, backend, ::Type{T}, maxdist, rtol, atol, maxsubdiv) where {T}
     _check_precision(backend, T, rtol, atol)
-    maxsubdiv = something(maxsubdiv, default_maxsubdiv(T))
     Kd = _convert_kernel(K, T)
     isbits(Kd) || throw(ArgumentError("kernel $K is not isbits"))
     msh = Inti.mesh(Y)
     etypes = collect(Inti.element_types(msh))
-    if length(etypes) != 1 || !(Inti.reference_domain(only(etypes)) isa Inti.ReferenceLine)
-        msg = "only meshes with a single type of line elements are supported, got $etypes"
+    supported = Union{Inti.ReferenceLine, Inti.ReferenceTriangle, Inti.ReferenceSquare}
+    if length(etypes) != 1 || !(Inti.reference_domain(only(etypes)) isa supported) ||
+            Inti.geometric_dimension(Inti.reference_domain(only(etypes))) != Inti.ambient_dimension(msh) - 1
+        msg = """only boundary meshes with a single type of line, triangle, or quadrilateral
+        elements are supported, got $etypes"""
         throw(ArgumentError(msg))
     end
     E = only(etypes)
+    maxsubdiv = something(maxsubdiv, default_maxsubdiv(Inti.reference_domain(E)))
     els = Inti.elements(msh, E)
     el2qtags = Inti.etype2qtags(Y, E)
     L = _lagrange_basis(Inti.quadrature_rule(Y, E), T)
     # element centers and translations, in the highest precision available on the backend
     S = KA.supports_float64(backend) ? Float64 : T
     N = Inti.ambient_dimension(msh)
-    centers = [SVector{N, S}(el(SVector(0.5))) for el in els]
+    centers = [SVector{N, S}(Inti.center(el)) for el in els]
     offsets = [_translate(K, els[n]) ? centers[n] : zero(centers[n]) for n in eachindex(els)]
     els_loc = [_convert_element(T, els[n], offsets[n]) for n in eachindex(els)]
     ynormal = Val(_has_normals(Y))
@@ -121,7 +123,7 @@ function Inti._adaptive_correction_plan(K, Y, backend, ::Type{T}, maxdist, rtol,
         backend,
         Kd,
         L,
-        _embedded_rule(T),
+        _embedded_rule(Inti.reference_domain(E), T),
         Float64(maxdist),
         T(rtol),
         T(atol),
@@ -215,74 +217,117 @@ end
 end
 
 """
-    struct EmbeddedRule1D{H,L,T}
+    struct EmbeddedRule{H,L,D,T,DOM}
 
-Isbits version of the embedded cubature used by `Inti.adaptive_quadrature(ReferenceLine())`
-(i.e. the default rule of `HAdaptiveIntegration` for an `Orthotope{1}`). The low order rule
-uses the first `L` of the `H` nodes.
+Isbits version of the embedded cubature used by `Inti.adaptive_quadrature` on a reference
+shape, i.e. the default rule of `HAdaptiveIntegration` for the corresponding domain
+`domain`. The low order rule uses the first `L` of the `H` nodes.
 """
-struct EmbeddedRule1D{H, L, T}
-    nodes::SVector{H, T}
+struct EmbeddedRule{H, L, D, T, DOM}
+    nodes::SVector{H, SVector{D, T}}
     weights_high::SVector{H, T}
     weights_low::SVector{L, T}
+    domain::DOM
 end
 
-function _embedded_rule(::Type{T}) where {T}
-    seg = HAdaptiveIntegration.Orthotope(zero(T), one(T))
-    ec = HAdaptiveIntegration.default_rule(seg)
-    H, L = length(ec.weights_high), length(ec.weights_low)
-    return EmbeddedRule1D(
-        SVector{H, T}(map(first, ec.nodes)),
+# domains used by `Inti.adaptive_quadrature` for each reference shape, in precision `T`
+_hadaptive_domain(::Inti.ReferenceLine, ::Type{T}) where {T} =
+    HAdaptiveIntegration.Orthotope(zero(T), one(T))
+_hadaptive_domain(::Inti.ReferenceTriangle, ::Type{T}) where {T} =
+    HAdaptiveIntegration.Triangle((zero(T), zero(T)), (one(T), zero(T)), (zero(T), one(T)))
+_hadaptive_domain(::Inti.ReferenceSquare, ::Type{T}) where {T} =
+    HAdaptiveIntegration.Rectangle((zero(T), zero(T)), (one(T), one(T)))
+
+function _embedded_rule(ref::Inti.ReferenceShape, ::Type{T}) where {T}
+    domain = _hadaptive_domain(ref, T)
+    ec = HAdaptiveIntegration.default_rule(domain)
+    H, L, D = length(ec.weights_high), length(ec.weights_low), length(first(ec.nodes))
+    return EmbeddedRule(
+        SVector{H}(map(x -> SVector{D, T}(x), ec.nodes)),
         SVector{H, T}(ec.weights_high),
         SVector{L, T}(ec.weights_low),
+        domain,
     )
 end
 
-# Integrate `f` over `[a,b]` using `rule`. Mirrors `(::EmbeddedCubature)(f, ::Orthotope)` in
+# number of children created by `HAdaptiveIntegration.default_subdivision`
+_nchildren(::Type{<:HAdaptiveIntegration.Orthotope{D}}) where {D} = 2^D
+_nchildren(::Type{<:HAdaptiveIntegration.Simplex{2}}) = 4
+
+# Integrate `f` over `domain` using `rule`. Mirrors `(::EmbeddedCubature)(f, domain)` in
 # HAdaptiveIntegration, including the order of the operations.
-@inline function _apply_rule(f, rule::EmbeddedRule1D{H, L}, a, b) where {H, L}
-    diff = b - a
+@inline function _apply_rule(f, rule::EmbeddedRule{H, L}, domain) where {H, L}
+    Φ, μ = HAdaptiveIntegration.map_from_reference(domain)
     @inbounds begin
-        v = f(SVector(a + rule.nodes[1] * diff))
+        v = f(Φ(rule.nodes[1]))
         Il = rule.weights_low[1] * v
         Ih = rule.weights_high[1] * v
         for i in 2:L
-            v = f(SVector(a + rule.nodes[i] * diff))
+            v = f(Φ(rule.nodes[i]))
             Il += rule.weights_low[i] * v
             Ih += rule.weights_high[i] * v
         end
         for i in (L + 1):H
-            Ih += rule.weights_high[i] * f(SVector(a + rule.nodes[i] * diff))
+            Ih += rule.weights_high[i] * f(Φ(rule.nodes[i]))
         end
     end
-    return diff * Ih, diff * norm(Ih - Il)
+    return μ * Ih, μ * norm(Ih - Il)
 end
+
+# Whether the integral over each panel is stored (rather than recomputed when the panel is
+# subdivided). Storing it saves one application of the rule per subdivision, but increases
+# the per-thread memory, which slows down GPU kernels when the integrand has many components
+# (e.g. Stokes kernels in 3D).
+_store_integrals(::Type{I}, ::Type{T}) where {I, T} = sizeof(I) ≤ 16 * sizeof(T)
+
+# number of panels after `maxsubdiv` subdivisions of a domain of type `DOM`
+_capacity(::Type{DOM}, maxsubdiv) where {DOM} = 1 + (_nchildren(DOM) - 1) * maxsubdiv
 
 """
     _adaptive_integrate(f, rule, rtol, atol, ::Val{MAXSUBDIV})
 
-Globally adaptive integration of `f` over `[0,1]`, reproducing `HAdaptiveIntegration.integrate`
-on an `Orthotope{1}`: the panel with the largest error estimate is bisected until `E ≤ atol` or
-`E ≤ rtol * norm(I)`, or until `MAXSUBDIV` subdivisions have been performed. The heap of
-HAdaptiveIntegration is replaced by fixed-size arrays and a linear search, so that the function
-can be called inside a GPU kernel.
+Globally adaptive integration of `f` over `rule.domain`, reproducing
+`HAdaptiveIntegration.integrate`, with at most `MAXSUBDIV` subdivisions and the panels stored
+in fixed-size per-thread arrays. See [`_refine!`](@ref).
 
 Return `I, nsubdiv, converged`.
 """
-@inline function _adaptive_integrate(f, rule::EmbeddedRule1D, rtol, atol, ::Val{MAXSUBDIV}) where {MAXSUBDIV}
-    S = eltype(rule.nodes)
-    a₀, b₀ = zero(S), one(S)
-    I, E = _apply_rule(f, rule, a₀, b₀)
-    CAP = MAXSUBDIV + 1 # each subdivision adds one panel
-    as = MVector{CAP, S}(undef)
-    bs = MVector{CAP, S}(undef)
-    Is = MVector{CAP, typeof(I)}(undef)
+@inline function _adaptive_integrate(f, rule::EmbeddedRule, rtol, atol, ::Val{MAXSUBDIV}) where {MAXSUBDIV}
+    S = eltype(eltype(rule.nodes))
+    DOM = typeof(rule.domain)
+    I, E = _apply_rule(f, rule, rule.domain)
+    CAP = _capacity(DOM, MAXSUBDIV)
+    STORE = _store_integrals(typeof(I), S)
+    panels = MVector{CAP, DOM}(undef)
     Es = MVector{CAP, typeof(E)}(undef)
-    @inbounds as[1], bs[1], Is[1], Es[1] = a₀, b₀, I, E
+    Is = MVector{STORE ? CAP : 0, typeof(I)}(undef)
+    return _refine!(panels, Es, Is, f, rule, I, E, rtol, atol, MAXSUBDIV, Val(STORE))
+end
+
+"""
+    _refine!(panels, Es, Is, f, rule, I, E, rtol, atol, maxsubdiv, ::Val{STORE})
+
+Refinement loop of [`_adaptive_integrate`](@ref), given the integral `I` and error estimate `E`
+over `rule.domain`. The panel with the largest error estimate is subdivided (with
+`HAdaptiveIntegration.default_subdivision`) until `E ≤ atol` or `E ≤ rtol * norm(I)`, or until
+`maxsubdiv` subdivisions have been performed, exactly as in `HAdaptiveIntegration.integrate`
+(whose heap is replaced by the arrays `panels`, `Es` and `Is`, and a linear search). If
+`STORE`, the integral over each panel is stored in `Is`; otherwise it is recomputed when the
+panel is subdivided (giving the same value, bit for bit).
+
+The arrays (e.g. per-thread static arrays, or views of global device memory) must have room
+for [`_capacity`](@ref) panels.
+"""
+@inline function _refine!(panels, Es, Is, f, rule::EmbeddedRule, I, E, rtol, atol, maxsubdiv, ::Val{STORE}) where {STORE}
+    dom₀ = rule.domain
+    NC = _nchildren(typeof(dom₀))
+    subdivide = HAdaptiveIntegration.default_subdivision(dom₀)
+    @inbounds panels[1], Es[1] = dom₀, E
+    STORE && (@inbounds Is[1] = I)
     npanels = 1
     nsubdiv = 0
     converged = (E ≤ atol) || (E ≤ rtol * norm(I))
-    @inbounds while !converged && nsubdiv < MAXSUBDIV
+    @inbounds while !converged && nsubdiv < maxsubdiv
         # find the panel with the largest error
         k = 1
         Emax = Es[1]
@@ -291,20 +336,21 @@ Return `I, nsubdiv, converged`.
                 k, Emax = m, Es[m]
             end
         end
-        a, b = as[k], bs[k]
-        I -= Is[k]
+        dom = panels[k]
+        Iₖ = STORE ? Is[k] : first(_apply_rule(f, rule, dom))
+        I -= Iₖ
         E -= Es[k]
-        mid = (a + b) / 2
-        # children in the same order as `HAdaptiveIntegration.subdivide_orthotope`
-        I₁, E₁ = _apply_rule(f, rule, mid, b)
-        I += I₁
-        E += E₁
-        I₂, E₂ = _apply_rule(f, rule, a, mid)
-        I += I₂
-        E += E₂
-        as[k], bs[k], Is[k], Es[k] = mid, b, I₁, E₁
-        npanels += 1
-        as[npanels], bs[npanels], Is[npanels], Es[npanels] = a, mid, I₂, E₂
+        children = subdivide(dom)
+        for c in 1:NC
+            child = children[c]
+            Ic, Ec = _apply_rule(f, rule, child)
+            I += Ic
+            E += Ec
+            # the first child replaces its parent, the others are appended
+            slot = c == 1 ? k : (npanels += 1)
+            panels[slot], Es[slot] = child, Ec
+            STORE && (Is[slot] = Ic)
+        end
         nsubdiv += 1
         converged = (E ≤ atol) || (E ≤ rtol * norm(I))
     end
@@ -312,19 +358,27 @@ Return `I, nsubdiv, converged`.
 end
 
 """
-    struct LagrangeBasis1D{N,M}
+    struct LagrangeBasis{K,E,M}
 
-Isbits version of `Inti.lagrange_basis(qrule)` for a quadrature rule on `ReferenceLine`.
+Isbits version of `Inti.lagrange_basis(qrule)`: `L(x) = C * m(x)`, where `m(x)` are the
+monomials `x^e` for the exponents `e` in `exponents` (all of degree at most `K` in each
+variable), and `C` is the pseudo-inverse of the Vandermonde matrix at the quadrature nodes.
 """
-struct LagrangeBasis1D{N, M}
+struct LagrangeBasis{K, E, M}
+    exponents::E
     C::M
 end
 
-@inline (L::LagrangeBasis1D{N})(x) where {N} = L.C * _line_monomials(Val(N), x[1])
+@inline (L::LagrangeBasis)(x) = L.C * _monomials(L, x)
 
-# monomials `1, t, …, t^(N-1)` computed by recurrence (`Float32 ^ Int` is computed in
-# `Float64` by Base, which is not supported by some GPU backends)
-@inline function _line_monomials(::Val{N}, t::T) where {N, T}
+@inline function _monomials(L::LagrangeBasis{K}, x::SVector{D}) where {K, D}
+    p = ntuple(d -> _powers(Val(K + 1), x[d]), Val(D))
+    return SVector(map(e -> prod(ntuple(d -> p[d][e[d] + 1], Val(D))), L.exponents))
+end
+
+# powers `1, t, …, t^(N-1)` computed by recurrence (`Float32 ^ Int` is computed in `Float64`
+# by Base, which is not supported by some GPU backends)
+@inline function _powers(::Val{N}, t::T) where {N, T}
     m = MVector{N, T}(undef)
     @inbounds m[1] = one(T)
     @inbounds for i in 2:N
@@ -333,12 +387,20 @@ end
     return SVector(m)
 end
 
-function _lagrange_basis(qrule::Inti.ReferenceQuadrature{Inti.ReferenceLine}, ::Type{T}) where {T}
-    N = length(qrule)
+# exponents of the monomials spanning the polynomial space of `qrule`
+_exponents(::Inti.ReferenceLine, k) = [(i,) for i in 0:k]
+_exponents(::Inti.ReferenceTriangle, k) = [(i, j) for j in 0:k for i in 0:k if i + j ≤ k]
+_exponents(::Inti.ReferenceSquare, k) = [(i, j) for j in 0:k for i in 0:k]
+
+function _lagrange_basis(qrule::Inti.ReferenceQuadrature, ::Type{T}) where {T}
+    ref = Inti.domain(qrule)
+    k = Inti.interpolation_order(qrule)
+    exps = Tuple(_exponents(ref, k))
     nodes = Inti.qcoords(qrule)
-    V = reduce(hcat, [_line_monomials(Val(N), Float64(x[1])) for x in nodes])
-    C = SMatrix{N, N, T}(pinv(V))
-    return LagrangeBasis1D{N, typeof(C)}(C)
+    L64 = LagrangeBasis{k, typeof(exps), Nothing}(exps, nothing)
+    V = reduce(hcat, [_monomials(L64, SVector{length(x), Float64}(x)) for x in nodes])
+    C = SMatrix{size(V, 2), size(V, 1), T}(pinv(V))
+    return LagrangeBasis{k, typeof(exps), typeof(C)}(exps, C)
 end
 
 # Same as `Inti._integration_measure`, but without the warning (string interpolation is not
@@ -472,12 +534,14 @@ end
         i, n = _pair_from_key(keys[p])
         T = eltype(cost)
         x = _local_target(T, X[i], offsets[n]).coords
-        np = size(ynodes, 1)
-        dmin = typemax(T)
-        for k in 1:np
-            dmin = min(dmin, norm(x - ynodes[k, n].coords))
+        dmin, spread = typemax(T), zero(T)
+        y₁ = ynodes[1, n].coords
+        for k in axes(ynodes, 1)
+            yk = ynodes[k, n].coords
+            dmin = min(dmin, norm(x - yk))
+            spread = max(spread, norm(yk - y₁))
         end
-        cost[p] = dmin / norm(ynodes[np, n].coords - ynodes[1, n].coords)
+        cost[p] = dmin / spread
     end
 end
 
@@ -492,73 +556,186 @@ function _cost_order(plan::AdaptiveCorrectionPlan, X, keys, npairs)
     return perm
 end
 
-@kernel function _nearfield_correction_kernel!(
-        nzval, colval, nsub, @Const(perm), @Const(keys), @Const(X), @Const(els),
+# Integrand for the pair encoded in `key`: `ŷ ↦ K(x, y(ŷ)) L(ŷ) τ′(ŷ)` on the reference element,
+# in coordinates centered at the element. Also returns the target and element index.
+@inline function _pair_integrand(key, X, els, offsets, oris, K, L, ::Type{T}) where {T}
+    i, n = _pair_from_key(key)
+    @inbounds x = _local_target(T, X[i], offsets[n])
+    @inbounds el, ori = els[n], oris[n]
+    integrand = (ŷ) -> begin
+        y = el(ŷ)
+        jac = Inti.jacobian(el, ŷ)
+        ν = Inti._normal(jac, ori)
+        τ′ = _integration_measure(jac)
+        M = K(x, (coords = y, normal = ν))
+        v = L(ŷ)
+        map(v -> M * v, v) * τ′
+    end
+    return integrand, x, n
+end
+
+# Write the correction of pair `p` (integrals `W` minus the regular quadrature) in the CSR
+# arrays, and the number of subdivisions `nb`, or `-nb - 1` (always negative) if the
+# tolerance was not met.
+@inline function _write_pair!(nzval, colval, nsub, p, W, nb, converged, x, n, K, ynodes, wnodes, el2qtags)
+    np = length(W)
+    @inbounds for k in 1:np
+        idx = np * (p - 1) + k
+        nzval[idx] = W[k] - K(x, ynodes[k, n]) * wnodes[k, n]
+        colval[idx] = el2qtags[k, n]
+    end
+    @inbounds nsub[p] = converged ? Int32(nb) : -Int32(nb) - Int32(1)
+    return
+end
+
+# First tier: panels stored in per-thread arrays of capacity `CAP` (see `_tiers`).
+@kernel function _correction_private_kernel!(
+        nzval, colval, nsub, @Const(list), @Const(keys), @Const(X), @Const(els),
         @Const(offsets), @Const(oris), @Const(ynodes), @Const(wnodes), @Const(el2qtags),
         K, L, rule, rtol, atol, maxsubdiv,
     )
     t = @index(Global, Linear)
-    @inbounds begin
-        p = isnothing(perm) ? t : Int(perm[t])
-        i, n = _pair_from_key(keys[p])
-        T = typeof(rtol)
-        x = _local_target(T, X[i], offsets[n])
-        el = els[n]
-        ori = oris[n]
-        integrand = (ŷ) -> begin
-            y = el(ŷ)
-            jac = Inti.jacobian(el, ŷ)
-            ν = Inti._normal(jac, ori)
-            τ′ = _integration_measure(jac)
-            M = K(x, (coords = y, normal = ν))
-            v = L(ŷ)
-            map(v -> M * v, v) * τ′
-        end
-        W, nb, converged = _adaptive_integrate(integrand, rule, rtol, atol, maxsubdiv)
-        np = length(W)
-        for k in 1:np
-            idx = np * (p - 1) + k
-            nzval[idx] = W[k] - K(x, ynodes[k, n]) * wnodes[k, n]
-            colval[idx] = el2qtags[k, n]
-        end
-        # number of subdivisions, or `-nb - 1` (always negative) if the tolerance was not met
-        nsub[p] = converged ? Int32(nb) : -Int32(nb) - Int32(1)
+    @inbounds p = isnothing(list) ? t : Int(list[t])
+    @inbounds f, x, n = _pair_integrand(keys[p], X, els, offsets, oris, K, L, typeof(rtol))
+    W, nb, converged = _adaptive_integrate(f, rule, rtol, atol, maxsubdiv)
+    _write_pair!(nzval, colval, nsub, p, W, nb, converged, x, n, K, ynodes, wnodes, el2qtags)
+end
+
+# Later tiers: panels stored in global memory, one column of the scratch arrays per work-item;
+# processes the pairs `list[offset + 1:offset + ndrange]`.
+@kernel function _correction_scratch_kernel!(
+        nzval, colval, nsub, @Const(list), offset, spanels, sEs, sIs, @Const(keys), @Const(X),
+        @Const(els), @Const(offsets), @Const(oris), @Const(ynodes), @Const(wnodes),
+        @Const(el2qtags), K, L, rule, rtol, atol, maxsubdiv, store,
+    )
+    t = @index(Global, Linear)
+    @inbounds p = Int(list[offset + t])
+    @inbounds f, x, n = _pair_integrand(keys[p], X, els, offsets, oris, K, L, typeof(rtol))
+    I, E = _apply_rule(f, rule, rule.domain)
+    W, nb, converged = _refine!(
+        view(spanels, :, t), view(sEs, :, t), view(sIs, :, t), f, rule, I, E, rtol, atol,
+        maxsubdiv, store,
+    )
+    _write_pair!(nzval, colval, nsub, p, W, nb, converged, x, n, K, ynodes, wnodes, el2qtags)
+end
+
+# per-thread memory budget (bytes) for the panels of the first tier
+const PRIVATE_BYTES = 4096
+# global memory budget (bytes) for the panels of the later tiers
+const SCRATCH_BYTES = 2^30
+
+"""
+    _tiers(plan, IT; private_bytes = PRIVATE_BYTES)
+
+Capacities (maximum numbers of subdivisions) of the successive tiers of the adaptive
+integration, for integrals of type `IT`. All the pairs are first integrated with per-thread
+storage for `caps[1]` subdivisions, chosen so that it fits in `private_bytes`. The pairs that
+did not converge are then integrated again from scratch with storage in global memory, with
+capacities increasing by a factor 8 up to `maxsubdiv`. Since the algorithm is deterministic,
+the result for a pair does not depend on the tier in which it converges.
+"""
+function _tiers(plan::AdaptiveCorrectionPlan, IT; private_bytes = PRIVATE_BYTES)
+    T = _float_type(plan)
+    DOM = typeof(plan.rule.domain)
+    pbytes = _panel_bytes(DOM, T, IT)
+    maxsubdiv = _val(plan.maxsubdiv)
+    cap = 4
+    while 2cap ≤ maxsubdiv && _capacity(DOM, 2cap) * pbytes ≤ private_bytes
+        cap *= 2
+    end
+    caps = [min(cap, maxsubdiv)]
+    while caps[end] < maxsubdiv
+        push!(caps, min(8 * caps[end], maxsubdiv))
+    end
+    return caps
+end
+
+_panel_bytes(::Type{DOM}, ::Type{T}, ::Type{IT}) where {DOM, T, IT} =
+    sizeof(DOM) + sizeof(T) + (_store_integrals(IT, T) ? sizeof(IT) : 0)
+
+@kernel function _failed_flags_kernel!(flags, @Const(list), @Const(nsub))
+    t = @index(Global, Linear)
+    @inbounds p = isnothing(list) ? t : Int(list[t])
+    @inbounds flags[t] = nsub[p] < 0 ? Int32(1) : Int32(0)
+end
+
+@kernel function _compact_kernel!(out, @Const(list), @Const(pos), @Const(flags))
+    t = @index(Global, Linear)
+    @inbounds if flags[t] == 1
+        out[pos[t]] = isnothing(list) ? Int32(t) : list[t]
     end
 end
 
+# Indices of the pairs in `list` (all `n` pairs if `list === nothing`) that did not converge,
+# in the same order as in `list` (so that the ordering by cost of the first tier is preserved
+# in the later tiers), and their number.
+function _failed_pairs(backend, list, nsub, n)
+    flags = KA.allocate(backend, Int32, n)
+    _failed_flags_kernel!(backend)(flags, list, nsub; ndrange = n)
+    pos = similar(flags)
+    AK.accumulate!(+, pos, flags; init = Int32(0), inclusive = true)
+    nfail = Int(Array(view(pos, n:n))[1])
+    out = KA.allocate(backend, Int32, max(nfail, 1))
+    nfail > 0 && _compact_kernel!(backend)(out, list, pos, flags; ndrange = n)
+    return out, nfail
+end
+
 """
-    _nearfield_values(plan, X, keys, npairs; sort_by_cost, workgroupsize = nothing)
+    _nearfield_values(plan, X, keys, npairs; sort_by_cost, private_bytes, scratch_bytes)
 
 Compute the values (and column indices) of the CSR correction matrix, together with the
-number of subdivisions used for each pair. If `sort_by_cost`, the pairs are processed in the
-order given by [`_cost_order`](@ref). This is the default on GPUs, where it reduces the
-divergence between work-items executed in lockstep; on the CPU backend the original order
-(pairs of the same target and neighboring elements are adjacent) is more cache-friendly.
+number of subdivisions used for each pair. The adaptive integration is performed in tiers of
+increasing capacity, see [`_tiers`](@ref).
+
+If `sort_by_cost`, the pairs of the first tier are processed in the order given by
+[`_cost_order`](@ref). This is the default on GPUs, where it reduces the divergence between
+work-items executed in lockstep; on the CPU backend the original order (pairs of the same
+target and neighboring elements are adjacent) is more cache-friendly.
 """
 function _nearfield_values(
         plan::AdaptiveCorrectionPlan, X, keys, npairs;
-        sort_by_cost = !(plan.backend isa typeof(KA.CPU())), workgroupsize = nothing,
+        sort_by_cost = !(plan.backend isa typeof(KA.CPU())),
+        private_bytes = PRIVATE_BYTES, scratch_bytes = SCRATCH_BYTES,
     )
     backend = plan.backend
     np = size(plan.el2qtags, 1)
     T = _float_type(plan)
     XT = Base.promote_op(_local_target, Type{T}, eltype(X), eltype(plan.offsets))
     VT = Inti.return_type(plan.kernel, XT, eltype(plan.ynodes))
+    IT = SVector{np, VT}
     nzval = KA.allocate(backend, VT, np * npairs)
     colval = KA.allocate(backend, Int32, np * npairs)
     nsub = KA.allocate(backend, Int32, npairs)
     npairs == 0 && return colval, nzval, nsub
-    kernel! = if isnothing(workgroupsize)
-        _nearfield_correction_kernel!(backend)
-    else
-        _nearfield_correction_kernel!(backend, workgroupsize)
-    end
-    perm = sort_by_cost ? _cost_order(plan, X, keys, npairs) : nothing
-    kernel!(
-        nzval, colval, nsub, perm, keys, X, plan.els, plan.offsets, plan.oris, plan.ynodes,
-        plan.wnodes, plan.el2qtags, plan.kernel, plan.basis, plan.rule, plan.rtol, plan.atol,
-        plan.maxsubdiv; ndrange = npairs,
+    args = (
+        keys, X, plan.els, plan.offsets, plan.oris, plan.ynodes, plan.wnodes, plan.el2qtags,
+        plan.kernel, plan.basis, plan.rule, plan.rtol, plan.atol,
     )
+    caps = _tiers(plan, IT; private_bytes)
+    # first tier: all pairs, per-thread storage
+    list = sort_by_cost ? _cost_order(plan, X, keys, npairs) : nothing
+    _correction_private_kernel!(backend)(nzval, colval, nsub, list, args..., Val(caps[1]); ndrange = npairs)
+    # later tiers: pairs that did not converge, storage in global memory
+    list, nlist = _failed_pairs(backend, list, nsub, npairs)
+    DOM = typeof(plan.rule.domain)
+    store = Val(_store_integrals(IT, T))
+    for cap in caps[2:end]
+        nlist == 0 && break
+        ncap = _capacity(DOM, cap)
+        batch = clamp(scratch_bytes ÷ (ncap * _panel_bytes(DOM, T, IT)), 1, nlist)
+        spanels = KA.allocate(backend, DOM, ncap, batch)
+        sEs = KA.allocate(backend, T, ncap, batch)
+        # (one unused row if the integrals are not stored, to avoid empty allocations)
+        sIs = KA.allocate(backend, IT, _store_integrals(IT, T) ? ncap : 1, batch)
+        for offset in 0:batch:(nlist - 1)
+            nb = min(batch, nlist - offset)
+            _correction_scratch_kernel!(backend)(
+                nzval, colval, nsub, list, offset, spanels, sEs, sIs, args..., cap, store;
+                ndrange = nb,
+            )
+        end
+        list, nlist = _failed_pairs(backend, list, nsub, nlist)
+    end
     return colval, nzval, nsub
 end
 

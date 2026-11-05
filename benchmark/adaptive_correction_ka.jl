@@ -11,14 +11,17 @@
     (requires `CUDA` in the benchmark environment: `] add CUDA`). Mesh sizes can be set with
     e.g. `INTI_BENCH_MESHSIZES=1e-2,2.5e-3`.
 
-    The geometry is an ellipse meshed by Gmsh with curved (P3) Lagrange elements, and the
-    targets are off-surface points at distances `d ∈ [1e-2 h, h]` (log-uniform) from the
-    boundary, two per boundary quadrature node (one on each side).
+    In 2D (default), the geometry is an ellipse meshed by Gmsh with curved (P3) Lagrange
+    elements. With `INTI_BENCH_DIM=3`, it is an ellipsoid with curved (P2) triangles, or
+    quadrilaterals with `INTI_BENCH_ELEMENT=quad`. The targets are off-surface points at
+    distances `d ∈ [1e-2 h, h]` (log-uniform) from the boundary, two per boundary quadrature
+    node (one on each side).
 
     Variants are labeled by backend, precision `T` of the integration, and precision of the
     targets `X` (Float64 whenever the backend supports it).
 
-    Timed stages (seconds; minimum over repetitions):
+    Timed stages (seconds; minimum over repetitions, after an untimed warm-up call; runs longer
+    than a second are not repeated):
     - plan:   one-time setup for the (fixed) source geometry, including transfer to the device
     - h2d:    transfer of the targets to the device (only if they live on the host)
     - search: nearly-singular pairs (target BVH, traversal, filter, sort)
@@ -32,7 +35,8 @@
               (single-threaded) host `SparseMatrixCSC` product
 
     Accuracy is the largest error in an entry of the correction, relative to the largest
-    entry (`scale`), measured against a Float64 reference computed with `rtol = 1e-10`. With
+    entry (`scale`), measured against a Float64 reference computed with `rtol = 1e-10` in 2D
+    and `rtol = 1e-8` in 3D. With
     targets in Float32, pairs at distance ≈ `maxdist` may be included or not differently from
     the reference; such entries count as errors.
     All variants use the same tolerances: `rtol` and `atol = 0.1 * rtol * scale`.
@@ -81,8 +85,29 @@ function ellipse_quadrature(; meshsize, order = 3, qorder = 5)
     return Inti.Quadrature(msh[Γ]; qorder)
 end
 
-function near_targets(Q, h; rng = MersenneTwister(0))
-    X = NamedTuple{(:coords, :normal), Tuple{SVector{2, Float64}, SVector{2, Float64}}}[]
+function ellipsoid_quadrature(; meshsize, quads = false, order = 2, qorder = 4)
+    Inti.clear_entities!()
+    msh = try
+        gmsh.initialize(String[], false)
+        gmsh.option.setNumber("General.Verbosity", 2)
+        gmsh.option.setNumber("Mesh.MeshSizeMax", meshsize)
+        gmsh.option.setNumber("Mesh.MeshSizeMin", meshsize)
+        quads && gmsh.option.setNumber("Mesh.RecombineAll", 1)
+        gmsh.model.occ.addSphere(0, 0, 0, 1)
+        gmsh.model.occ.dilate([(3, 1)], 0, 0, 0, 1, 0.8, 0.6)
+        gmsh.model.occ.synchronize()
+        gmsh.model.mesh.generate(2)
+        gmsh.model.mesh.set_order(order)
+        Inti.import_mesh(; dim = 3)
+    finally
+        gmsh.finalize()
+    end
+    Γ = Inti.Domain(e -> Inti.geometric_dimension(e) == 2, msh)
+    return Inti.Quadrature(msh[Γ]; qorder)
+end
+
+function near_targets(Q::Inti.Quadrature{N}, h; rng = MersenneTwister(0)) where {N}
+    X = NamedTuple{(:coords, :normal), Tuple{SVector{N, Float64}, SVector{N, Float64}}}[]
     for q in Q, side in (-1, 1)
         d = h * 10^(-2 * rand(rng))
         push!(X, (coords = q.coords + side * d * q.normal, normal = q.normal))
@@ -90,10 +115,13 @@ function near_targets(Q, h; rng = MersenneTwister(0))
     return X
 end
 
-# minimum wall time over `n` runs, after one warm-up run; `f` must synchronize
-function besttime(f, n)
+# Minimum wall time over `n` runs of `f` (which must synchronize). The first, untimed, call
+# absorbs the compilation. If a timed run takes longer than `long` seconds, it is not repeated.
+function besttime(f, n; long = 1.0)
     f()
-    return minimum(_ -> @elapsed(f()), 1:n)
+    t = @elapsed f()
+    t > long && return t
+    return min(t, minimum(_ -> @elapsed(f()), 1:(n - 1); init = Inf))
 end
 
 function device_stages(K, Q, X, maxdist, rtol, atol, backend, T, nrep)
@@ -103,13 +131,14 @@ function device_stages(K, Q, X, maxdist, rtol, atol, backend, T, nrep)
     plan = mkplan()
     # targets in the precision of the plan's centers (Float64 if supported by the backend)
     S = eltype(eltype(plan.centers))
-    Xh = [(coords = SVector{2, S}(x.coords), normal = SVector{2, S}(x.normal)) for x in X]
+    N = length(first(X).coords)
+    Xh = [(coords = SVector{N, S}(x.coords), normal = SVector{N, S}(x.normal)) for x in X]
     Xd = Ext._to_device(backend, Xh)
     m = length(X)
     keys, npairs = Ext._nearfield_keys(plan, Xd)
     _, _, nsub = Ext._nearfield_values(plan, Xd, keys, npairs)
     δ = Inti.adaptive_correction(plan, Xd)
-    σ = Ext._to_device(backend, rand(eltype(δ) <: SMatrix ? SVector{2, T} : T, length(Q)))
+    σ = Ext._to_device(backend, rand(eltype(δ) <: SMatrix ? SVector{N, T} : T, length(Q)))
     y = KernelAbstractions.allocate(backend, Base.promote_op(*, eltype(δ), eltype(σ)), m)
     t = (
         plan = tplan,
@@ -148,10 +177,12 @@ function row(kname, variant, rtol, npairs, t, err, nsub)
     return @printf(" | %8.1e %5.1f\n", err, nsub)
 end
 
-function run_benchmark(; meshsizes, nrep = 3, maxdist_factor = 3)
+function run_benchmark(; dim, meshsizes, quads = false, nrep = 3)
     gpu = gpu_backend()
-    println("Julia threads: ", Threads.nthreads(), "   GPU backend: ", gpu)
-    laplace, stokes = Inti.Laplace(; dim = 2), Inti.Stokes(; μ = 1.0, dim = 2)
+    println("Julia threads: ", Threads.nthreads(), "   GPU backend: ", gpu, "   dimension: ", dim)
+    laplace, stokes = Inti.Laplace(; dim), Inti.Stokes(; μ = 1.0, dim)
+    maxdist_factor = dim == 2 ? 3 : 2
+    rtols, rtol_ref = dim == 2 ? ((1.0e-5, 1.0e-8), 1.0e-10) : ((1.0e-5, 1.0e-6), 1.0e-8)
     kernels = (
         "Laplace SL" => Inti.SingleLayerKernel(laplace),
         "Laplace DL" => Inti.DoubleLayerKernel(laplace),
@@ -160,22 +191,24 @@ function run_benchmark(; meshsizes, nrep = 3, maxdist_factor = 3)
     )
     gpu_name = BACKEND_NAME == "cuda" ? "CUDA" : "Metal"
     for h in meshsizes
-        Q = ellipse_quadrature(; meshsize = h)
+        Q = dim == 2 ? ellipse_quadrature(; meshsize = h) : ellipsoid_quadrature(; meshsize = h, quads)
+        E = only(Inti.element_types(Inti.mesh(Q)))
+        np = size(Inti.etype2qtags(Q, E), 1)
         X = near_targets(Q, h)
         maxdist = maxdist_factor * h
         println()
-        println("h = $h: $(length(Q) ÷ 3) elements, $(length(Q)) sources, $(length(X)) targets, maxdist = $maxdist")
+        println("h = $h: $(length(Q) ÷ np) elements ($(nameof(typeof(Inti.reference_domain(E))))), $(length(Q)) sources, $(length(X)) targets, maxdist = $maxdist")
         header()
         for (kname, K) in kernels
             iop = Inti.IntegralOperator(K, X, Q)
-            δref = Inti.adaptive_correction(iop; maxdist, rtol = 1.0e-10, atol = 0.0, backend = CPU(), maxsubdiv = 1024)
-            npairs = nnz(δref) ÷ 3
+            δref = Inti.adaptive_correction(iop; maxdist, rtol = rtol_ref, atol = 0.0, backend = CPU(), maxsubdiv = 16384)
+            npairs = nnz(δref) ÷ np
             scale = maximum(norm, nonzeros(δref))
-            for rtol in (1.0e-5, 1.0e-8)
+            for rtol in rtols
                 atol = 0.1 * rtol * scale
                 # Inti's default path (host)
                 δ = Inti.adaptive_correction(iop; maxdist, rtol, atol)
-                σ = rand(eltype(δ) <: SMatrix ? SVector{2, Float64} : Float64, length(Q))
+                σ = rand(eltype(δ) <: SMatrix ? SVector{dim, Float64} : Float64, length(Q))
                 t = (
                     step = besttime(() -> Inti.adaptive_correction(iop; maxdist, rtol, atol), nrep),
                     mul = besttime(() -> δ * σ, max(nrep, 10)),
@@ -205,6 +238,11 @@ function run_benchmark(; meshsizes, nrep = 3, maxdist_factor = 3)
     return
 end
 
-meshsizes = haskey(ENV, "INTI_BENCH_MESHSIZES") ?
-    parse.(Float64, split(ENV["INTI_BENCH_MESHSIZES"], ",")) : [1.0e-2, 2.5e-3, 6.25e-4, 1.5625e-4]
-run_benchmark(; meshsizes)
+dim = parse(Int, get(ENV, "INTI_BENCH_DIM", "2"))
+quads = get(ENV, "INTI_BENCH_ELEMENT", "tri") == "quad"
+meshsizes = if haskey(ENV, "INTI_BENCH_MESHSIZES")
+    parse.(Float64, split(ENV["INTI_BENCH_MESHSIZES"], ","))
+else
+    dim == 2 ? [1.0e-2, 2.5e-3, 6.25e-4, 1.5625e-4] : [0.2, 0.1]
+end
+run_benchmark(; dim, meshsizes, quads)

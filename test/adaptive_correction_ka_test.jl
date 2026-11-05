@@ -50,7 +50,7 @@ same_pattern(A, B) = findnz(A)[1:2] == findnz(B)[1:2]
     F2(a, d) = G(1 - a, d) - G(-a, d)
     a = 0.3
     for T in (Float64, Float32), d in (1.0e-1, 1.0e-2, 1.0e-3)
-        rule = Ext._embedded_rule(T)
+        rule = Ext._embedded_rule(Inti.ReferenceLine(), T)
         rtol = T == Float64 ? 1.0e-10 : 1.0e-5
         f = t -> SVector(1 / ((t[1] - T(a))^2 + T(d)^2), log((t[1] - T(a))^2 + T(d)^2))
         I, nsub, converged = Ext._adaptive_integrate(f, rule, T(rtol), zero(T), Val(256))
@@ -66,7 +66,7 @@ same_pattern(A, B) = findnz(A)[1:2] == findnz(B)[1:2]
         end
     end
     # exhausting `maxsubdiv` is reported
-    rule = Ext._embedded_rule(Float64)
+    rule = Ext._embedded_rule(Inti.ReferenceLine(), Float64)
     f = t -> 1 / ((t[1] - a)^2 + 1.0e-8)
     _, nsub, converged = Ext._adaptive_integrate(f, rule, 1.0e-12, 0.0, Val(4))
     @test nsub == 4 && !converged
@@ -257,13 +257,23 @@ end
     c0, v0, n0 = Ext._nearfield_values(plan, Xd, keys, npairs; sort_by_cost = false)
     c1, v1, n1 = Ext._nearfield_values(plan, Xd, keys, npairs; sort_by_cost = true)
     @test c0 == c1 && v0 == v1 && n0 == n1
-    # default bound on the number of subdivisions depends on the precision
-    @test Ext._val(plan.maxsubdiv) == 64
-    @test Ext._val(Inti.adaptive_correction_plan(laplace_sl, Q; backend = CPU(), maxdist = 3h, rtol = 1.0e-8).maxsubdiv) == 256
+    # tiers: forcing a tiny first tier sends most pairs to the later tiers (storage in global
+    # memory, in several batches), with the same result
+    c2, v2, n2 = Ext._nearfield_values(plan, Xd, keys, npairs; private_bytes = 0, scratch_bytes = 2^16)
+    @test Ext._tiers(plan, SVector{3, eltype(v0)}; private_bytes = 0)[1] == 4
+    @test count(>(4), Array(n0)) > 0
+    @test c0 == c2 && v0 == v2 && n0 == n2
+    c3, v3, n3 = Ext._nearfield_values(plan, Xd, keys, npairs; sort_by_cost = true, private_bytes = 0, scratch_bytes = 2^16)
+    @test c0 == c3 && v0 == v3 && n0 == n3
+    # the compaction of the pairs that did not converge preserves their order
+    list = Int32[5, 3, 9, 1, 7]
+    nsub_ = Int32[-1, 0, -2, 0, -1, 0, 3, 0, -5]
+    out, nfail = Ext._failed_pairs(CPU(), list, nsub_, length(list))
+    @test nfail == 4 && out[1:nfail] == Int32[5, 3, 9, 1]
     # targets far away: empty correction
     δ0 = Inti.adaptive_correction(plan, [(coords = SVector(10.0, 10.0), normal = SVector(1.0, 0.0))])
     @test nnz(δ0) == 0 && size(δ0) == (1, length(Q))
-    # only meshes with a single type of line elements (here: triangles)
+    # only boundary meshes are supported (here: triangles of a 2D domain)
     Inti.clear_entities!()
     msh2 = try
         gmsh.initialize(String[], false)
@@ -279,4 +289,81 @@ end
     Ω2 = Inti.Domain(e -> Inti.geometric_dimension(e) == 2, msh2)
     Q2 = Inti.Quadrature(msh2[Ω2]; qorder = 2)
     @test_throws ArgumentError Inti.adaptive_correction_plan(laplace_sl, Q2; backend = CPU(), maxdist = 0.1, rtol = 1.0e-5)
+end
+
+function sphere_quadrature(; meshsize, quads, order = 2, qorder = 4)
+    Inti.clear_entities!()
+    msh = try
+        gmsh.initialize(String[], false)
+        gmsh.option.setNumber("General.Verbosity", 2)
+        gmsh.option.setNumber("Mesh.MeshSizeMax", meshsize)
+        gmsh.option.setNumber("Mesh.MeshSizeMin", meshsize)
+        quads && gmsh.option.setNumber("Mesh.RecombineAll", 1)
+        gmsh.model.occ.addSphere(0, 0, 0, 1)
+        gmsh.model.occ.synchronize()
+        gmsh.model.mesh.generate(2)
+        gmsh.model.mesh.set_order(order)
+        Inti.import_mesh(; dim = 3)
+    finally
+        gmsh.finalize()
+    end
+    Γ = Inti.Domain(e -> Inti.geometric_dimension(e) == 2, msh)
+    return Inti.Quadrature(msh[Γ]; qorder)
+end
+
+@testset "Adaptive integrator on triangles and squares" begin
+    # same algorithm as HAdaptiveIntegration: identical results
+    f = u -> SVector(1 / ((u[1] - 0.3)^2 + (u[2] - 0.2)^2 + 1.0e-4), log((u[1] - 0.3)^2 + (u[2] - 0.2)^2 + 1.0e-4))
+    for ref in (Inti.ReferenceTriangle(), Inti.ReferenceSquare())
+        rule = Ext._embedded_rule(ref, Float64)
+        I, nsub, converged = Ext._adaptive_integrate(f, rule, 1.0e-10, 0.0, Val(4096))
+        Iref, _ = Inti.HAdaptiveIntegration.integrate(f, Ext._hadaptive_domain(ref, Float64); rtol = 1.0e-10, atol = 0.0)
+        @test converged && nsub > 100
+        @test norm(I - Iref) ≤ 1.0e-14 * norm(Iref)
+    end
+    # Lagrange bases
+    for qrule in (Inti.Gauss(; domain = :triangle, order = 4), Inti.TensorProductQuadrature(Inti.GaussLegendre(3), Inti.GaussLegendre(3)))
+        L, Lref = Ext._lagrange_basis(qrule, Float64), Inti.lagrange_basis(qrule)
+        for x in (SVector(0.1, 0.2), SVector(0.3, 0.3), SVector(0.0, 0.0))
+            @test L(x) ≈ Lref(x) atol = 1.0e-12
+        end
+    end
+end
+
+@testset "3D, $(quads ? "quadrilaterals" : "triangles")" for quads in (false, true)
+    h3 = 0.4
+    Q3 = sphere_quadrature(; meshsize = h3, quads)
+    laplace3, stokes3 = Inti.Laplace(; dim = 3), Inti.Stokes(; μ = 1.2, dim = 3)
+    # agreement with the default path (Float64)
+    X3 = vcat(offsurface_targets(Q3[1:9:end], h3, δs, -1), offsurface_targets(Q3[1:9:end], h3, δs, 1))
+    kernels3 = quads ? (Inti.DoubleLayerKernel(laplace3), Inti.DoubleLayerKernel(stokes3)) :
+        (Inti.SingleLayerKernel(laplace3), Inti.DoubleLayerKernel(laplace3), Inti.HyperSingularKernel(laplace3), Inti.SingleLayerKernel(stokes3), Inti.DoubleLayerKernel(stokes3))
+    for K in kernels3
+        iop = Inti.IntegralOperator(K, X3, Q3)
+        kw = (maxdist = 2h3, rtol = 1.0e-6, atol = 0.0)
+        δref = Inti.adaptive_correction(iop; kw...)
+        δka = Inti.adaptive_correction(iop; kw..., backend = CPU())
+        @test same_pattern(δka, δref)
+        @test relerr(δka, δref) < 1.0e-10
+    end
+    # Green's representation formula (see the 2D test), Float64 and Float32
+    for op in (laplace3, stokes3)
+        xs = SVector(3.0, 3.0, 3.0)
+        c = op isa Inti.Stokes ? SVector(0.3, -0.7, 0.5) : 1.0
+        γ₀u = [Inti.SingleLayerKernel(op)(q, xs) * c for q in Q3]
+        γ₁u = [Inti.AdjointDoubleLayerKernel(op)(q, xs) * c for q in Q3]
+        for side in (-1, 1)
+            Xs = offsurface_targets(Q3[1:9:end], h3, (0.1, 0.5), side)
+            u = side == -1 ? [Inti.SingleLayerKernel(op)(x, xs) * c for x in Xs] : [zero(c) for x in Xs]
+            Sop = Inti.IntegralOperator(Inti.SingleLayerKernel(op), Xs, Q3)
+            Dop = Inti.IntegralOperator(Inti.DoubleLayerKernel(op), Xs, Q3)
+            S, D = Inti.assemble_matrix(Sop), Inti.assemble_matrix(Dop)
+            er(δS, δD) = norm(norm.((S + δS) * γ₁u - (D + δD) * γ₀u - u), Inf) / norm(norm.(γ₀u), Inf)
+            @test er(0 * S, 0 * D) > 0.1 # the correction is needed
+            kw = (maxdist = 2h3, rtol = 1.0e-6, atol = 0.0)
+            @test er(Inti.adaptive_correction(Sop; kw..., backend = CPU()), Inti.adaptive_correction(Dop; kw..., backend = CPU())) < 1.0e-4
+            kw = (maxdist = 2h3, rtol = 1.0e-5, atol = 1.0e-6)
+            @test er(Inti.adaptive_correction(Sop; kw..., backend = CPU(), T = Float32), Inti.adaptive_correction(Dop; kw..., backend = CPU(), T = Float32)) < 1.0e-3
+        end
+    end
 end
