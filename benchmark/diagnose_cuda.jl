@@ -5,7 +5,9 @@
 
     with `stage` one of `kernels`, `pocl32`, `pocl64`, `cuda64`, `cuda32`, or one of the minimal
     POCL (CPU backend) checks `panels32`, `panels64`, `simplex32`, `rule32`, `map32`, `apply32`,
-    `apply32_fields`, `rule32_fields` (default: `kernels`).
+    `apply32_fields`, `rule32_fields`, or `ptx32` (compiled code and profile of the CUDA kernels
+    in Float32; default: `kernels`). The stage `rule32` is a reproducer of a crash of the CPU
+    backend on x86, which is expected.
     Each stage prints a line before starting, so that a crash can be located. For the
     correction stages, the following environment variables can be set:
     - `INTI_DIAG_DIM=2`: ellipse (line elements) instead of a sphere
@@ -240,7 +242,69 @@ function check_apply(how)
     return say("  ok, sum = ", sum(out))
 end
 
-if stage == "map32"
+# 5. compiled code of the Float32 correction kernels on CUDA: Float64 instructions, local
+# memory, and a profile (time, registers and local memory per kernel launch)
+function ptx_report(ptx, pattern)
+    # split the PTX module into entries, and keep those whose name matches `pattern`
+    entries = split(ptx, r"\.entry "; keepempty = false)
+    for e in entries
+        name = first(split(e, '('))
+        occursin(pattern, name) || continue
+        lines = split(e, '\n')
+        instr = filter(lines) do l
+            l = strip(l)
+            return !isempty(l) && l ∉ ("{", "}") && !startswith(l, ".") && !startswith(l, "//") &&
+                !startswith(l, "\$") && !endswith(l, ":")
+        end
+        f64 = filter(l -> occursin(".f64", l), instr)
+        ops = Dict{String, Int}()
+        for l in f64
+            op = first(split(strip(l)))
+            ops[op] = get(ops, op, 0) + 1
+        end
+        depot = match(r"__local_depot\d+\[(\d+)\]", e)
+        say("    entry ", first(name, 60), "…")
+        say(
+            "      instructions: ", length(instr), ", with .f64: ", length(f64),
+            ", ld.local: ", count(l -> occursin("ld.local", l), instr),
+            ", st.local: ", count(l -> occursin("st.local", l), instr),
+            ", local depot (bytes/thread): ", isnothing(depot) ? 0 : depot[1]
+        )
+        say("      .f64 instructions by opcode: ", sort(collect(ops); by = last, rev = true)[1:min(end, 10)])
+    end
+    return
+end
+
+function check_ptx()
+    h = 0.2
+    Q = sphere_quadrature(; meshsize = h)
+    X = [(coords = q.coords + s * δ * h * q.normal, normal = q.normal) for q in Q for δ in (1.0e-2, 0.1, 0.5) for s in (-1, 1)]
+    Xd = CuArray(X)
+    for K in (Inti.SingleLayerKernel(Inti.Laplace(; dim = 3)), Inti.SingleLayerKernel(Inti.Stokes(; μ = 1.0, dim = 3)))
+        say("  ", nameof(typeof(K)), " ", nameof(typeof(K.op)), ", Float32 integration, Float64 targets")
+        plan = Inti.adaptive_correction_plan(K, Q; backend = CUDABackend(), T = Float32, maxdist = 2h, rtol = 1.0e-5, atol = 1.0e-6)
+        keys, npairs = Ext._nearfield_keys(plan, Xd)
+        io = IOBuffer()
+        CUDA.@device_code_ptx io = io begin
+            Ext._nearfield_values(plan, Xd, keys, npairs)
+            CUDA.synchronize()
+        end
+        ptx_report(String(take!(io)), r"correction_(private|scratch)")
+        say("  profile of one integration ($npairs pairs):")
+        prof = CUDA.@profile trace = true begin
+            Ext._nearfield_values(plan, Xd, keys, npairs)
+            CUDA.synchronize()
+        end
+        show(stdout, MIME"text/plain"(), prof)
+        println()
+        flush(stdout)
+    end
+    return
+end
+
+if stage == "ptx32"
+    check_ptx()
+elseif stage == "map32"
     check_map()
 elseif stage == "apply32"
     check_apply(:struct)
