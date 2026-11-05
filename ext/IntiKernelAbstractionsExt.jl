@@ -2,6 +2,8 @@ module IntiKernelAbstractionsExt
 
 import Inti
 import KernelAbstractions as KA
+import AcceleratedKernels as AK
+import ImplicitBVH
 using KernelAbstractions: @kernel, @index, @Const
 using LinearAlgebra
 using SparseArrays
@@ -22,28 +24,6 @@ const RTOL_FLOOR_FACTOR = 64
 
 const DEFAULT_MAXSUBDIV = 256
 
-function Inti._adaptive_correction_ka(
-        iop,
-        maxdist,
-        rtol,
-        atol,
-        backend,
-        ::Type{T},
-        threads;
-        maxsubdiv = DEFAULT_MAXSUBDIV,
-        kwargs...,
-    ) where {T}
-    isempty(kwargs) || throw(
-        ArgumentError(
-            "unsupported keyword arguments for the KernelAbstractions backend: $(keys(kwargs))",
-        ),
-    )
-    prep = _ka_to_device(_ka_host_prepare(iop, maxdist, rtol, atol, backend, T, maxsubdiv, threads))
-    out = _ka_allocate_output(prep)
-    _ka_nearfield!(out, prep)
-    return _ka_assemble(prep, _ka_to_host(out))
-end
-
 function _check_precision(backend, ::Type{T}, rtol, atol) where {T}
     if T == Float64 && !KA.supports_float64(backend)
         throw(ArgumentError("backend $backend does not support Float64; use e.g. `T = Float32`"))
@@ -59,71 +39,106 @@ function _check_precision(backend, ::Type{T}, rtol, atol) where {T}
 end
 
 """
-    _ka_host_prepare(iop, maxdist, rtol, atol, backend, T, maxsubdiv, threads)
+    struct AdaptiveCorrectionPlan
 
-Build the list of nearly-singular (target, element) interactions, and all data needed by the
-kernel converted to the floating point type `T`, on the host. See [`_ka_to_device`](@ref) for
-the transfer to `backend`.
-
-When possible (see [`_translate`](@ref)), each element, its quadrature nodes, and the targets
-paired with it are expressed in coordinates centered at the element. The translation is
-computed in the precision of the mesh before rounding to `T`, so that the rounding error in
-`x - y` is of order `eps(T) * h` (with `h` the element size) instead of `eps(T) * |x|`.
+Source data needed to compute nearly-singular corrections on a device; see
+[`Inti.adaptive_correction_plan`](@ref). Element-wise data is stored in coordinates centered
+at each element (when the kernel allows it, see [`_translate`](@ref)), with the centers
+stored in the highest precision supported by the backend.
 """
-function _ka_host_prepare(iop, maxdist, rtol, atol, backend, ::Type{T}, maxsubdiv, threads) where {T}
+struct AdaptiveCorrectionPlan{B, T, KT, LT, RT, MS, E, C, Y, W, Q, O, BV}
+    backend::B
+    kernel::KT
+    basis::LT
+    rule::RT
+    maxdist::Float64
+    rtol::T
+    atol::T
+    maxsubdiv::MS
+    nsources::Int
+    els::E      # elements (translated), in precision `T`
+    offsets::C  # translation of each element (its center, or zero)
+    centers::C  # element centers
+    ynodes::Y   # `(coords, normal)` of the quadrature nodes (translated), `Np × nel`
+    wnodes::W   # quadrature weights, `Np × nel`
+    el2qtags::Q # global index of the quadrature nodes, `Np × nel`
+    oris::O     # element orientations
+    bvh::BV     # bounding volume hierarchy of the balls of radius ≈ `maxdist` around `centers`
+end
+
+function Base.show(io::IO, plan::AdaptiveCorrectionPlan{B, T}) where {B, T}
+    nel = length(plan.els)
+    return print(
+        io, "AdaptiveCorrectionPlan on $(plan.backend) ($T): $nel elements, ",
+        "$(plan.nsources) sources, maxdist = $(plan.maxdist)",
+    )
+end
+
+_float_type(::AdaptiveCorrectionPlan{B, T}) where {B, T} = T
+_val(::Val{N}) where {N} = N
+
+function Inti._adaptive_correction_plan(K, Y, backend, ::Type{T}, maxdist, rtol, atol, maxsubdiv) where {T}
     _check_precision(backend, T, rtol, atol)
-    X, Y, K = Inti.target(iop), Inti.source(iop), Inti.kernel(iop)
-    msh = Inti.mesh(Y)
+    maxsubdiv = something(maxsubdiv, DEFAULT_MAXSUBDIV)
     Kd = _convert_kernel(K, T)
     isbits(Kd) || throw(ArgumentError("kernel $K is not isbits"))
-    dict_near = Inti.near_interaction_list([Inti.coords(x) for x in X], msh; tol = maxdist)
-    # type-level flags, so that the node types below are inferred
-    xnormal = Val(_has_normals(X))
-    ynormal = Val(_has_normals(Y))
-    rule = _embedded_rule(T)
-    etypes = map(collect(Inti.element_types(msh))) do E
-        Inti.reference_domain(E) isa Inti.ReferenceLine || throw(
-            ArgumentError("only line elements are supported by the KernelAbstractions backend"),
-        )
-        els = Inti.elements(msh, E)
-        oris = Inti.orientation(msh, E)
-        el2qtags = Inti.etype2qtags(Y, E)
-        pairs = _nearfield_pairs(X, Y, el2qtags, dict_near[E], maxdist, threads)
-        qrule = Inti.quadrature_rule(Y, E)
-        L = _lagrange_basis(qrule, T)
-        # element centers (zero if no translation is performed)
-        centers = map(el -> _translate(K, el) ? el(SVector(0.5)) : zero(el(SVector(0.5))), els)
-        els_loc = [_convert_element(T, els[n], centers[n]) for n in eachindex(els)]
-        ynodes = [_device_node(T, Y[el2qtags[k, n]], centers[n], ynormal) for k in axes(el2qtags, 1), n in axes(el2qtags, 2)]
-        wnodes = [T(Inti.weight(Y[j])) for j in el2qtags]
-        pair_el = [n for (_, n) in pairs]
-        pair_x = [_device_node(T, X[i], centers[n], xnormal) for (i, n) in pairs]
-        return (
-            pairs = pairs,
-            el2qtags = el2qtags,
-            pair_el = pair_el,
-            pair_x = pair_x,
-            els = els_loc,
-            oris = Int32.(oris),
-            ynodes = ynodes,
-            wnodes = wnodes,
-            L = L,
-        )
+    msh = Inti.mesh(Y)
+    etypes = collect(Inti.element_types(msh))
+    if length(etypes) != 1 || !(Inti.reference_domain(only(etypes)) isa Inti.ReferenceLine)
+        msg = "only meshes with a single type of line elements are supported, got $etypes"
+        throw(ArgumentError(msg))
     end
-    Ex = eltype(first(etypes).pair_x)
-    Ey = eltype(first(etypes).ynodes)
-    VT = Inti.return_type(Kd, Ex, Ey)
-    return (
-        backend = backend,
-        size = size(iop),
-        K = Kd,
-        VT = VT,
-        rule = rule,
-        rtol = T(rtol),
-        atol = T(atol),
-        maxsubdiv = Val(maxsubdiv),
-        etypes = etypes,
+    E = only(etypes)
+    els = Inti.elements(msh, E)
+    el2qtags = Inti.etype2qtags(Y, E)
+    L = _lagrange_basis(Inti.quadrature_rule(Y, E), T)
+    # element centers and translations, in the highest precision available on the backend
+    S = KA.supports_float64(backend) ? Float64 : T
+    N = Inti.ambient_dimension(msh)
+    centers = [SVector{N, S}(el(SVector(0.5))) for el in els]
+    offsets = [_translate(K, els[n]) ? centers[n] : zero(centers[n]) for n in eachindex(els)]
+    els_loc = [_convert_element(T, els[n], offsets[n]) for n in eachindex(els)]
+    ynormal = Val(_has_normals(Y))
+    ynodes = [
+        _device_node(T, Y[el2qtags[k, n]], offsets[n], ynormal) for
+            k in axes(el2qtags, 1), n in axes(el2qtags, 2)
+    ]
+    wnodes = [T(Inti.weight(Y[j])) for j in el2qtags]
+    # BVH of the balls of radius `maxdist` around the centers. The radius is enlarged to
+    # account for the rounding of the centers and targets to `T`; the exact criterion is
+    # applied afterwards.
+    cmax = maximum(c -> norm(c, Inf), centers)
+    r = maxdist + 8 * eps(T) * (cmax + maxdist)
+    balls = [_bsphere(T, c, r) for c in centers]
+    bvh = ImplicitBVH.BVH(_to_device(backend, balls), ImplicitBVH.BBox{T})
+    return AdaptiveCorrectionPlan(
+        backend,
+        Kd,
+        L,
+        _embedded_rule(T),
+        Float64(maxdist),
+        T(rtol),
+        T(atol),
+        Val(maxsubdiv),
+        length(Y),
+        _to_device(backend, els_loc),
+        _to_device(backend, offsets),
+        _to_device(backend, centers),
+        _to_device(backend, ynodes),
+        _to_device(backend, wnodes),
+        _to_device(backend, Int32.(el2qtags)),
+        _to_device(backend, Int32.(Inti.orientation(msh, E))),
+        bvh,
     )
+end
+
+# bounding sphere (in 3D, as required by ImplicitBVH) of radius `r` centered at `x`
+@inline function _bsphere(::Type{T}, x, r) where {T}
+    if length(x) == 2
+        return ImplicitBVH.BSphere{T}((T(x[1]), T(x[2]), zero(T)), T(r))
+    else
+        return ImplicitBVH.BSphere{T}((T(x[1]), T(x[2]), T(x[3])), T(r))
+    end
 end
 
 """
@@ -138,63 +153,7 @@ _translate(K, el) = false
 _translation_invariant(::Union{Inti.Laplace, Inti.Stokes}) = true
 _translation_invariant(op) = false
 
-"""
-    _ka_to_device(prep)
-
-Transfer the arrays of `prep` (see [`_ka_host_prepare`](@ref)) to `prep.backend`.
-"""
-function _ka_to_device(prep)
-    backend = prep.backend
-    etypes = map(prep.etypes) do et
-        return merge(
-            et,
-            (
-                pair_el = _to_device(backend, et.pair_el),
-                pair_x = _to_device(backend, et.pair_x),
-                els = _to_device(backend, et.els),
-                oris = _to_device(backend, et.oris),
-                ynodes = _to_device(backend, et.ynodes),
-                wnodes = _to_device(backend, et.wnodes),
-            ),
-        )
-    end
-    KA.synchronize(backend)
-    return merge(prep, (etypes = etypes,))
-end
-
 _to_device(backend, x::AbstractArray) = copyto!(KA.allocate(backend, eltype(x), size(x)), x)
-
-# Same filter as in `Inti._adaptive_correction_etype!`: a target `i` is paired with element
-# `n` if the closest quadrature node of `n` is within `maxdist`. Singular interactions (the
-# target coincides with a quadrature node of `n`) are not supported.
-function _nearfield_pairs(X, Y, el2qtags, nearlist, maxdist, threads)
-    nel = size(el2qtags, 2)
-    pairs_per_el = Vector{Vector{NTuple{2, Int32}}}(undef, nel)
-    nsing = Threads.Atomic{Int}(0)
-    Inti.@maybe_threads threads for n in 1:nel
-        jglob = view(el2qtags, :, n)
-        pairs_n = NTuple{2, Int32}[]
-        for i in nearlist[n]
-            xi = Inti.coords(X[i])
-            dmin = minimum(j -> norm(xi - Inti.coords(Y[j])), jglob)
-            dmin > maxdist && continue
-            if iszero(dmin)
-                Threads.atomic_add!(nsing, 1)
-                continue
-            end
-            push!(pairs_n, (Int32(i), Int32(n)))
-        end
-        pairs_per_el[n] = pairs_n
-    end
-    if nsing[] > 0
-        msg = """the KernelAbstractions backend supports only nearly-singular corrections,
-        but $(nsing[]) target(s) coincide with source quadrature nodes. Use the default
-        (`backend = nothing`) path instead."""
-        throw(ArgumentError(msg))
-    end
-    # note: `reduce(vcat, ...)` without `init` uses an efficient specialization
-    return isempty(pairs_per_el) ? NTuple{2, Int32}[] : reduce(vcat, pairs_per_el)
-end
 
 function _has_normals(X)
     normals = map(_normal_or_nothing, X)
@@ -236,6 +195,17 @@ _convert_op(op::Inti.Stokes{N}, ::Type{T}) where {N, T} = Inti.Stokes{N}(T(op.μ
 function _convert_op(op, ::Type{T}) where {T}
     T == Float64 && return op
     throw(ArgumentError("conversion of $op to $T is not implemented"))
+end
+
+# Target `x` in coordinates centered at `c`, in precision `T`. The translation is computed in
+# the highest of the precisions of `x` and `c`.
+@inline function _local_target(::Type{T}, x, c) where {T}
+    xc = Inti.coords(x)
+    N = length(xc)
+    R = promote_type(eltype(xc), eltype(c))
+    coords = SVector{N, T}(SVector{N, R}(xc) - SVector{N, R}(c))
+    nx = _normal_or_nothing(x)
+    return (coords = coords, normal = isnothing(nx) ? nothing : SVector{N, T}(nx))
 end
 
 """
@@ -376,26 +346,127 @@ end
     end
 end
 
-@kernel function _nearfield_correction_kernel!(
-        V,
-        nsub,
-        @Const(pair_el),
-        @Const(pair_x),
-        @Const(els),
-        @Const(oris),
-        @Const(ynodes),
-        @Const(wnodes),
-        K,
-        L,
-        rule,
-        rtol,
-        atol,
-        maxsubdiv,
+## Search of the nearly-singular interactions
+
+# keys encoding a (target, element) pair, sorted by target first
+@inline _pair_key(i, n) = (UInt64(i) << 32) | UInt64(n)
+@inline _pair_from_key(key) = (Int32(key >> 32), Int32(key & 0xffffffff))
+const INVALID_KEY = typemax(UInt64)
+
+# Same criterion as `Inti.near_interaction_list` followed by the filter in
+# `Inti._adaptive_correction_etype!`: the target `i` interacts with element `n` if it is within
+# `maxdist` of the center of `n`, and if its closest quadrature node in `n` is within
+# `maxdist`. A target whose distance to a quadrature node is below the rounding errors made
+# in computing that distance (rounding of the target, of the translation, and of the node in
+# local coordinates) is considered to coincide with it (singular interaction).
+@kernel function _filter_candidates_kernel!(
+        keys, nsing, @Const(candidates), @Const(X), @Const(offsets), @Const(centers),
+        @Const(ynodes), maxdist,
     )
     p = @index(Global, Linear)
     @inbounds begin
-        n = pair_el[p]
-        x = pair_x[p]
+        n, i = candidates[p]
+        x = Inti.coords(X[i])
+        c, o = centers[n], offsets[n]
+        N = length(x)
+        R = promote_type(eltype(x), eltype(c))
+        valid = norm(SVector{N, R}(x) - SVector{N, R}(c)) ≤ maxdist
+        xo = SVector{N, R}(x) - SVector{N, R}(o)
+        dmin = typemax(R)
+        singular = false
+        for k in axes(ynodes, 1)
+            yk = ynodes[k, n].coords
+            d = norm(xo - SVector{N, R}(yk))
+            tol = 2 * (eps(eltype(x)) * norm(x) + eps(R) * norm(o) + eps(eltype(yk)) * norm(yk))
+            singular |= d ≤ tol
+            dmin = min(dmin, d)
+        end
+        valid &= dmin ≤ maxdist
+        singular &= valid
+        if singular
+            KA.@atomic nsing[1] += Int32(1)
+        end
+        keys[p] = (valid && !singular) ? _pair_key(i, n) : INVALID_KEY
+    end
+end
+
+@kernel function _target_balls_kernel!(balls, @Const(X))
+    i = @index(Global, Linear)
+    @inbounds balls[i] = _bsphere(_float_type(eltype(balls)), Inti.coords(X[i]), 0)
+end
+
+_float_type(::Type{ImplicitBVH.BSphere{T}}) where {T} = T
+
+"""
+    _nearfield_keys(plan, X)
+
+Return a sorted device vector of keys encoding the nearly-singular (target, element) pairs,
+and the number `npairs` of such pairs (the first `npairs` keys).
+"""
+function _nearfield_keys(plan::AdaptiveCorrectionPlan, X)
+    backend = plan.backend
+    T = _float_type(plan)
+    balls = KA.allocate(backend, ImplicitBVH.BSphere{T}, length(X))
+    _target_balls_kernel!(backend)(balls, X; ndrange = length(X))
+    bvh = ImplicitBVH.BVH(balls, ImplicitBVH.BBox{T})
+    traversal = ImplicitBVH.traverse(plan.bvh, bvh)
+    ncand = traversal.num_contacts
+    keys = KA.allocate(backend, UInt64, ncand)
+    ncand == 0 && return keys, 0
+    nsing = KA.zeros(backend, Int32, 1)
+    _filter_candidates_kernel!(backend)(
+        keys, nsing, traversal.contacts, X, plan.offsets, plan.centers, plan.ynodes,
+        eltype(eltype(plan.centers))(plan.maxdist); ndrange = ncand,
+    )
+    nsing = Array(nsing)[1]
+    if nsing > 0
+        msg = """the KernelAbstractions backend supports only nearly-singular corrections,
+        but $nsing target(s) coincide with source quadrature nodes. Use the default
+        (`backend = nothing`) path instead."""
+        throw(ArgumentError(msg))
+    end
+    AK.sort!(keys)
+    npairs = AK.mapreduce(k -> Int(k != INVALID_KEY), +, keys; init = 0)
+    return keys, npairs
+end
+
+## Assembly
+
+@kernel function _row_keys_kernel!(rowkeys)
+    i = @index(Global, Linear)
+    @inbounds rowkeys[i] = _pair_key(i, 0)
+end
+
+@kernel function _rowptr_kernel!(rowptr, @Const(first_pair), np)
+    i = @index(Global, Linear)
+    @inbounds rowptr[i] = Int32(np * (first_pair[i] - 1) + 1)
+end
+
+# Row pointers of the CSR matrix: the keys are sorted by target, and each pair contributes
+# `np` consecutive entries.
+function _csr_rowptr(plan::AdaptiveCorrectionPlan, keys, npairs, m)
+    backend = plan.backend
+    np = size(plan.el2qtags, 1)
+    np * npairs < typemax(Int32) || error("number of nonzeros exceeds typemax(Int32)")
+    rowkeys = KA.allocate(backend, UInt64, m + 1)
+    _row_keys_kernel!(backend)(rowkeys; ndrange = m + 1)
+    first_pair = KA.allocate(backend, Int, m + 1)
+    AK.searchsortedfirst!(first_pair, view(keys, 1:npairs), rowkeys)
+    rowptr = KA.allocate(backend, Int32, m + 1)
+    _rowptr_kernel!(backend)(rowptr, first_pair, np; ndrange = m + 1)
+    return rowptr
+end
+
+@kernel function _nearfield_correction_kernel!(
+        nzval, colval, nsub, @Const(keys), @Const(X), @Const(els), @Const(offsets),
+        @Const(oris), @Const(ynodes), @Const(wnodes), @Const(el2qtags),
+        K, L, rule, rtol, atol, maxsubdiv,
+    )
+    p = @index(Global, Linear)
+    @inbounds begin
+        i, n = _pair_from_key(keys[p])
+        T = typeof(rtol)
+        x = _local_target(T, X[i], offsets[n])
         el = els[n]
         ori = oris[n]
         integrand = (ŷ) -> begin
@@ -408,99 +479,148 @@ end
             map(v -> M * v, v) * τ′
         end
         W, nb, converged = _adaptive_integrate(integrand, rule, rtol, atol, maxsubdiv)
-        for k in 1:length(W)
-            V[k, p] = W[k] - K(x, ynodes[k, n]) * wnodes[k, n]
+        np = length(W)
+        for k in 1:np
+            idx = np * (p - 1) + k
+            nzval[idx] = W[k] - K(x, ynodes[k, n]) * wnodes[k, n]
+            colval[idx] = el2qtags[k, n]
         end
         # number of subdivisions, or `-nb - 1` (always negative) if the tolerance was not met
         nsub[p] = converged ? Int32(nb) : -Int32(nb) - Int32(1)
     end
 end
 
-function _ka_allocate_output(prep)
-    return map(prep.etypes) do et
-        np = size(et.el2qtags, 1)
-        npairs = length(et.pairs)
-        V = KA.allocate(prep.backend, prep.VT, np, npairs)
-        nsub = KA.allocate(prep.backend, Int32, npairs)
-        return (V = V, nsub = nsub)
-    end
-end
-
 """
-    _ka_nearfield!(out, prep; workgroupsize = nothing)
+    _nearfield_values(plan, X, keys, npairs; workgroupsize = nothing)
 
-Launch the nearly-singular correction kernels. All inputs and outputs live on
-`prep.backend`; the function returns after the kernels have completed. If `workgroupsize`
-is `nothing`, the backend chooses it.
+Compute the values (and column indices) of the CSR correction matrix, together with the
+number of subdivisions used for each pair.
 """
-function _ka_nearfield!(out, prep; workgroupsize = nothing)
-    backend = prep.backend
+function _nearfield_values(plan::AdaptiveCorrectionPlan, X, keys, npairs; workgroupsize = nothing)
+    backend = plan.backend
+    np = size(plan.el2qtags, 1)
+    T = _float_type(plan)
+    XT = Base.promote_op(_local_target, Type{T}, eltype(X), eltype(plan.offsets))
+    VT = Inti.return_type(plan.kernel, XT, eltype(plan.ynodes))
+    nzval = KA.allocate(backend, VT, np * npairs)
+    colval = KA.allocate(backend, Int32, np * npairs)
+    nsub = KA.allocate(backend, Int32, npairs)
+    npairs == 0 && return colval, nzval, nsub
     kernel! = if isnothing(workgroupsize)
         _nearfield_correction_kernel!(backend)
     else
         _nearfield_correction_kernel!(backend, workgroupsize)
     end
-    for (et, o) in zip(prep.etypes, out)
-        npairs = length(et.pairs)
-        npairs == 0 && continue
-        kernel!(
-            o.V,
-            o.nsub,
-            et.pair_el,
-            et.pair_x,
-            et.els,
-            et.oris,
-            et.ynodes,
-            et.wnodes,
-            prep.K,
-            et.L,
-            prep.rule,
-            prep.rtol,
-            prep.atol,
-            prep.maxsubdiv;
-            ndrange = npairs,
-        )
-    end
-    KA.synchronize(backend)
-    return out
+    kernel!(
+        nzval, colval, nsub, keys, X, plan.els, plan.offsets, plan.oris, plan.ynodes,
+        plan.wnodes, plan.el2qtags, plan.kernel, plan.basis, plan.rule, plan.rtol, plan.atol,
+        plan.maxsubdiv; ndrange = npairs,
+    )
+    return colval, nzval, nsub
 end
 
-"""
-    _ka_to_host(out)
-
-Transfer the output of [`_ka_nearfield!`](@ref) to the host.
-"""
-_ka_to_host(out) = map(o -> (V = Array(o.V), nsub = Array(o.nsub)), out)
-
-"""
-    _ka_assemble(prep, out)
-
-Check that all interactions in `out` (on the host) converged, and assemble the sparse
-correction matrix.
-"""
-function _ka_assemble(prep, out)
-    nfail = sum(o -> count(<(0), o.nsub), out; init = 0)
+function _check_convergence(plan::AdaptiveCorrectionPlan, nsub)
+    isempty(nsub) && return
+    nfail = AK.mapreduce(s -> Int(s < 0), +, nsub; init = 0)
     if nfail > 0
         msg = """adaptive integration did not reach the requested tolerance for $nfail
-        interaction(s) within `maxsubdiv = $(_val(prep.maxsubdiv))` subdivisions. Increase
+        interaction(s) within `maxsubdiv = $(_val(plan.maxsubdiv))` subdivisions. Increase
         `maxsubdiv`, loosen the tolerance, or use a higher precision `T`. Note that a purely
         relative tolerance may not be attainable in precision `T` when an integral is small
         compared to its integrand (e.g. double-layer kernels); consider setting `atol`."""
         error(msg)
     end
-    nnz = sum(o -> length(o.V), out; init = 0)
-    Is, Js, Vs = Vector{Int}(undef, nnz), Vector{Int}(undef, nnz), Vector{prep.VT}(undef, nnz)
-    idx = 0
-    for (et, o) in zip(prep.etypes, out)
-        for (p, (i, n)) in enumerate(et.pairs), k in axes(o.V, 1)
-            idx += 1
-            Is[idx], Js[idx], Vs[idx] = i, et.el2qtags[k, n], o.V[k, p]
-        end
-    end
-    m, n = prep.size
-    return sparse(Is, Js, Vs, m, n)
+    return
 end
 
-_val(::Val{N}) where {N} = N
+function Inti.adaptive_correction(plan::AdaptiveCorrectionPlan, X::AbstractVector)
+    m = length(X)
+    keys, npairs = _nearfield_keys(plan, X)
+    rowptr = _csr_rowptr(plan, keys, npairs, m)
+    colval, nzval, nsub = _nearfield_values(plan, X, keys, npairs)
+    _check_convergence(plan, nsub)
+    return DeviceSparseMatrixCSR(m, plan.nsources, rowptr, colval, nzval)
+end
+
+# convenience path used by `adaptive_correction(iop; backend)`: targets on the host, result
+# returned as a `SparseMatrixCSC`
+function Inti._adaptive_correction_host(plan::AdaptiveCorrectionPlan, X)
+    S = eltype(eltype(plan.centers))
+    xnormal = Val(_has_normals(X))
+    Xd = _to_device(plan.backend, [_device_node(S, x, zero(Inti.coords(x)), xnormal) for x in X])
+    return SparseMatrixCSC(Inti.adaptive_correction(plan, Xd))
+end
+
+## Sparse matrix in CSR format on a device
+
+"""
+    struct DeviceSparseMatrixCSR{Tv}
+
+Sparse matrix in compressed sparse row format, with the arrays `rowptr`, `colval` and
+`nzval` living on a device. The column indices within each row are sorted. Supports
+`mul!(y, A, x[, α, β])` and `A * x` for vectors on the same device, and conversion to the
+host with `SparseMatrixCSC(A)`.
+"""
+struct DeviceSparseMatrixCSR{Tv, P, C, V}
+    m::Int
+    n::Int
+    rowptr::P
+    colval::C
+    nzval::V
+    function DeviceSparseMatrixCSR(m, n, rowptr::P, colval::C, nzval::V) where {P, C, V}
+        return new{eltype(nzval), P, C, V}(m, n, rowptr, colval, nzval)
+    end
+end
+
+Base.size(A::DeviceSparseMatrixCSR) = (A.m, A.n)
+Base.size(A::DeviceSparseMatrixCSR, d::Integer) = d == 1 ? A.m : (d == 2 ? A.n : 1)
+Base.eltype(::DeviceSparseMatrixCSR{Tv}) where {Tv} = Tv
+SparseArrays.nnz(A::DeviceSparseMatrixCSR) = length(A.nzval)
+KA.get_backend(A::DeviceSparseMatrixCSR) = KA.get_backend(A.nzval)
+
+function Base.show(io::IO, A::DeviceSparseMatrixCSR)
+    return print(
+        io, "$(A.m)×$(A.n) DeviceSparseMatrixCSR{$(eltype(A))} with $(nnz(A)) stored entries ",
+        "on $(KA.get_backend(A))",
+    )
+end
+
+@kernel function _csr_mul_kernel!(y, @Const(rowptr), @Const(colval), @Const(nzval), @Const(x), α, β)
+    i = @index(Global, Linear)
+    @inbounds begin
+        acc = zero(eltype(y))
+        for k in rowptr[i]:(rowptr[i + 1] - 1)
+            acc += nzval[k] * x[colval[k]]
+        end
+        y[i] = iszero(β) ? α * acc : α * acc + β * y[i]
+    end
+end
+
+function LinearAlgebra.mul!(y::AbstractVector, A::DeviceSparseMatrixCSR, x::AbstractVector, α::Number, β::Number)
+    size(A, 2) == length(x) || throw(DimensionMismatch("A has $(size(A, 2)) columns, x has length $(length(x))"))
+    size(A, 1) == length(y) || throw(DimensionMismatch("A has $(size(A, 1)) rows, y has length $(length(y))"))
+    backend = KA.get_backend(A)
+    size(A, 1) == 0 && return y
+    _csr_mul_kernel!(backend)(y, A.rowptr, A.colval, A.nzval, x, α, β; ndrange = size(A, 1))
+    return y
+end
+
+LinearAlgebra.mul!(y::AbstractVector, A::DeviceSparseMatrixCSR, x::AbstractVector) =
+    mul!(y, A, x, true, false)
+
+function Base.:*(A::DeviceSparseMatrixCSR, x::AbstractVector)
+    Ty = Base.promote_op(*, eltype(A), eltype(x))
+    y = KA.allocate(KA.get_backend(A), Ty, size(A, 1))
+    return mul!(y, A, x)
+end
+
+function SparseArrays.SparseMatrixCSC(A::DeviceSparseMatrixCSR)
+    rowptr, colval, nzval = Array(A.rowptr), Array(A.colval), Array(A.nzval)
+    I = Vector{Int}(undef, length(nzval))
+    for i in 1:A.m, k in rowptr[i]:(rowptr[i + 1] - 1)
+        I[k] = i
+    end
+    return sparse(I, Int.(colval), nzval, A.m, A.n)
+end
 
 end # module

@@ -64,20 +64,10 @@ correction in polar coordinates on the reference domain. You can then call
 # KernelAbstractions backend
 
 Passing a `KernelAbstractions` backend (e.g. `backend = CPU()` or `backend =
-MetalBackend()`) computes the nearly-singular corrections with a device kernel that
-reproduces the adaptive quadrature of the default path (same embedded rule, subdivision,
-and stopping criterion). This requires loading `KernelAbstractions`, and currently
-supports only:
-
-- source meshes of line elements (two-dimensional problems);
-- nearly-singular interactions, i.e. no target may coincide with a source quadrature node
-  (an `ArgumentError` is thrown otherwise);
-- `LagrangeElement`s for `T ≠ Float64`, where `T` is the floating point type used on the
-  device (e.g. `T = Float32` for backends without `Float64` support).
-
-The keyword `maxsubdiv` bounds the number of subdivisions per interaction; if the requested
-tolerance is not met within it, an error is thrown. Tolerances that cannot be achieved in
-precision `T` are rejected.
+MetalBackend()`) computes the nearly-singular corrections on that backend, and returns the
+result as a `SparseMatrixCSC` on the host. See [`adaptive_correction_plan`](@ref) for the
+requirements, the meaning of `T` and `maxsubdiv`, and for keeping the data and the result
+on the device.
 """
 function adaptive_correction(
         iop::IntegralOperator;
@@ -89,17 +79,17 @@ function adaptive_correction(
         T = Float64,
         kwargs...,
     )
-    # check if we need to compute a tolerance and/or a maxdist
-    hastol = ((rtol !== nothing) || (atol !== nothing))
-    if isnothing(maxdist) || !hastol
-        maxdist_, rtol_, atol_ = local_correction_dist_and_tol(iop)
-    end
-    # normalize inputs
-    maxdist = isnothing(maxdist) ? maxdist_ : maxdist
-    rtol = isnothing(rtol) ? (hastol ? 0.0 : rtol_) : rtol
-    atol = isnothing(atol) ? (hastol ? 0.0 : atol_) : atol
+    maxdist, rtol, atol = _correction_dist_and_tol(iop, maxdist, rtol, atol)
     if !isnothing(backend)
-        return _adaptive_correction_ka(iop, maxdist, rtol, atol, backend, T, threads; kwargs...)
+        unsupported = setdiff(keys(kwargs), (:maxsubdiv,))
+        if !isempty(unsupported)
+            msg = "unsupported keyword arguments with a `backend`: $(Tuple(unsupported))"
+            throw(ArgumentError(msg))
+        end
+        plan = adaptive_correction_plan(
+            kernel(iop), source(iop); maxdist, rtol, atol, backend, T, kwargs...,
+        )
+        return _adaptive_correction_host(plan, target(iop))
     end
     T == Float64 || throw(ArgumentError("`T` is only supported together with a `backend`"))
     # go on and compute the correction
@@ -117,11 +107,74 @@ function adaptive_correction(
     return adaptive_correction(iop, maxdist, quads_dict, threads)
 end
 
-function _adaptive_correction_ka(args...; kwargs...)
-    return error(
-        "_adaptive_correction_ka not found. Did you forget to import KernelAbstractions?",
-    )
+# fill in the missing `maxdist`, `rtol` and `atol` using `local_correction_dist_and_tol`
+function _correction_dist_and_tol(iop, maxdist, rtol, atol)
+    hastol = ((rtol !== nothing) || (atol !== nothing))
+    if isnothing(maxdist) || !hastol
+        maxdist_, rtol_, atol_ = local_correction_dist_and_tol(iop)
+    end
+    maxdist = isnothing(maxdist) ? maxdist_ : maxdist
+    rtol = isnothing(rtol) ? (hastol ? 0.0 : rtol_) : rtol
+    atol = isnothing(atol) ? (hastol ? 0.0 : atol_) : atol
+    return maxdist, rtol, atol
 end
+
+"""
+    adaptive_correction_plan(K, Y::Quadrature; backend, T = Float64, [maxdist, rtol, atol, maxsubdiv])
+
+Prepare the computation of nearly-singular corrections for the kernel `K` and the source
+quadrature `Y` on the `KernelAbstractions` backend `backend`. The source data is
+transferred to the device once, so that corrections for different sets of targets can then
+be computed with `adaptive_correction(plan, X)`, where `X` is a vector of targets on the
+device (e.g. `SVector`s, or `(coords, normal)` named tuples when the kernel needs the target
+normal).
+
+The result of `adaptive_correction(plan, X)` is a sparse matrix in CSR format living on the
+device, which can be applied with `mul!(y, δ, x[, α, β])` (with `x` and `y` on the device),
+or converted to the host with `SparseMatrixCSC(δ)`. All steps (search of the
+nearly-singular interactions, adaptive integration, and assembly) are performed on the
+device.
+
+The parameters `maxdist`, `rtol` and `atol` have the same meaning as in
+[`adaptive_correction`](@ref). The integrals are computed by reproducing the adaptive
+quadrature of the default path (same embedded rule, subdivision, and stopping criterion), in
+precision `T` (e.g. `T = Float32` for backends without `Float64` support). The keyword
+`maxsubdiv` bounds the number of subdivisions per interaction; if the requested tolerance is
+not met within it, an error is thrown. Tolerances that cannot be achieved in precision `T`
+are rejected.
+
+The targets `X` may be given in a higher precision than `T`: the target coordinates relative
+to each element are computed in that precision before being rounded to `T`.
+
+Requires loading `KernelAbstractions`, `AcceleratedKernels` and `ImplicitBVH`. Currently
+only supports:
+
+- source meshes with a single type of line elements (two-dimensional problems);
+- nearly-singular interactions, i.e. no target may coincide with a source quadrature node
+  (an `ArgumentError` is thrown otherwise);
+- `LagrangeElement`s for `T ≠ Float64`.
+"""
+function adaptive_correction_plan(
+        K,
+        Y::Quadrature;
+        backend,
+        T = Float64,
+        maxdist = nothing,
+        rtol = nothing,
+        atol = nothing,
+        maxsubdiv = nothing,
+    )
+    maxdist, rtol, atol = _correction_dist_and_tol(IntegralOperator(K, Y, Y), maxdist, rtol, atol)
+    return _adaptive_correction_plan(K, Y, backend, T, maxdist, rtol, atol, maxsubdiv)
+end
+
+function _adaptive_correction_plan(args...)
+    msg = """_adaptive_correction_plan not found. Did you forget to import
+    KernelAbstractions, AcceleratedKernels and ImplicitBVH?"""
+    return error(msg)
+end
+
+function _adaptive_correction_host end
 
 function adaptive_correction(iop, maxdist, quads_dict::OrderedDict, threads = true)
     # unpack type-unstable fields in iop, allocate output, and dispatch

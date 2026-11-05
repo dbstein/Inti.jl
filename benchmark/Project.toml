@@ -1,5 +1,7 @@
 [deps]
+AcceleratedKernels = "6a4ca0a5-0e36-4168-a932-d9be78d558f1"
 Gmsh = "705231aa-382f-11e9-3f0c-b7cb4346fdeb"
+ImplicitBVH = "932a18dc-bb55-4cd5-bdd6-1368ec9cea29"
 Inti = "fb74042b-437e-4c5b-88cf-d4e2beb394d5"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
@@ -11,3 +13,4 @@ StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 
 [sources]
 Inti = {path = ".."}
+ImplicitBVH = {url = "https://github.com/StellaOrg/ImplicitBVH.jl", rev = "main"}

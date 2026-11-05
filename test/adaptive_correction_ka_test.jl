@@ -1,6 +1,7 @@
 #=
     Tests for the KernelAbstractions implementation of the nearly-singular adaptive correction
-    (`adaptive_correction(iop; backend)`). Only the `CPU()` backend is tested here.
+    (`adaptive_correction(iop; backend)` and `adaptive_correction_plan`). Only the `CPU()`
+    backend is tested here.
 =#
 
 using Test
@@ -10,6 +11,8 @@ using StaticArrays
 using ForwardDiff
 using Inti
 using KernelAbstractions
+using AcceleratedKernels
+using ImplicitBVH
 using Gmsh
 
 const Ext = Base.get_extension(Inti, :IntiKernelAbstractionsExt)
@@ -196,4 +199,76 @@ end
     Qp = Inti.Quadrature(Γ; meshsize = h, qorder = 5)
     iop_p = Inti.IntegralOperator(Inti.SingleLayerKernel(laplace), offsurface_targets(Qp, h, δs, 1), Qp)
     @test_throws ArgumentError Inti.adaptive_correction(iop_p; kw..., rtol = 1.0e-5, backend = CPU(), T = Float32)
+end
+
+@testset "Device API" begin
+    laplace_sl = Inti.SingleLayerKernel(laplace)
+    plan = Inti.adaptive_correction_plan(laplace_sl, Q; backend = CPU(), maxdist = 3h, rtol = 1.0e-8, atol = 0.0)
+    Xd = [(coords = x.coords, normal = x.normal) for x in X]
+    # nearly-singular pairs: same as `near_interaction_list` followed by the filter on the
+    # distance to the closest quadrature node
+    keys, npairs = Ext._nearfield_keys(plan, Xd)
+    pairs = Set(Ext._pair_from_key(k) for k in Array(keys)[1:npairs])
+    msh = Inti.mesh(Q)
+    E = only(Inti.element_types(msh))
+    el2qtags = Inti.etype2qtags(Q, E)
+    nearlist = Inti.near_interaction_list([Inti.coords(x) for x in X], msh; tol = 3h)[E]
+    pairs_ref = Set{NTuple{2, Int32}}()
+    for n in eachindex(nearlist), i in nearlist[n]
+        dmin = minimum(j -> norm(X[i].coords - Q[j].coords), el2qtags[:, n])
+        dmin ≤ 3h && push!(pairs_ref, (i, n))
+    end
+    @test pairs == pairs_ref
+    # CSR structure and application
+    δ = Inti.adaptive_correction(plan, Xd)
+    δref = Inti.adaptive_correction(Inti.IntegralOperator(laplace_sl, X, Q); maxdist = 3h, rtol = 1.0e-8, atol = 0.0)
+    δh = SparseMatrixCSC(δ)
+    @test size(δ) == size(δref)
+    @test same_pattern(δh, δref) && relerr(δh, δref) < 1.0e-10
+    rowptr, colval = Array(δ.rowptr), Array(δ.colval)
+    @test all(i -> issorted(colval[rowptr[i]:(rowptr[i + 1] - 1)]), 1:size(δ, 1))
+    σ = rand(length(Q))
+    y = rand(length(Xd))
+    @test δ * σ ≈ δh * σ
+    @test mul!(copy(y), δ, σ, 2.0, -0.5) ≈ 2.0 * (δh * σ) - 0.5 * y
+    # targets without normals (the single layer kernel does not need them), and reuse of
+    # the plan for a different set of targets
+    Xs = [x.coords for x in offsurface_targets(Q, h, (0.05, 0.3), 1)]
+    δs = Inti.adaptive_correction(plan, Xs)
+    δs_ref = Inti.adaptive_correction(Inti.IntegralOperator(laplace_sl, Xs, Q); maxdist = 3h, rtol = 1.0e-8, atol = 0.0)
+    @test relerr(SparseMatrixCSC(δs), δs_ref) < 1.0e-10
+    # block (Stokes) entries
+    stokes_dl = Inti.DoubleLayerKernel(stokes)
+    plan = Inti.adaptive_correction_plan(stokes_dl, Q; backend = CPU(), T = Float32, maxdist = 3h, rtol = 1.0e-5, atol = 1.0e-6)
+    δ = Inti.adaptive_correction(plan, Xd)
+    @test eltype(δ) == SMatrix{2, 2, Float32, 4}
+    σ = rand(SVector{2, Float32}, length(Q))
+    @test δ * σ ≈ SparseMatrixCSC(δ) * σ
+    # singular interactions are detected relative to the rounding errors of the targets: with
+    # Float64 targets, a target at distance 1e-6 (≈ 8 eps(Float32) |x|) from a node is nearly
+    # singular even when T = Float32, while a target on a node is singular
+    plan32 = Inti.adaptive_correction_plan(laplace_sl, Q; backend = CPU(), T = Float32, maxdist = 3h, rtol = 1.0e-5, atol = 1.0e-6)
+    q = Q[1]
+    δn = Inti.adaptive_correction(plan32, [q.coords + 1.0e-6 * q.normal])
+    @test nnz(δn) > 0
+    @test_throws ArgumentError Inti.adaptive_correction(plan32, [q.coords])
+    # targets far away: empty correction
+    δ0 = Inti.adaptive_correction(plan, [(coords = SVector(10.0, 10.0), normal = SVector(1.0, 0.0))])
+    @test nnz(δ0) == 0 && size(δ0) == (1, length(Q))
+    # only meshes with a single type of line elements (here: triangles)
+    Inti.clear_entities!()
+    msh2 = try
+        gmsh.initialize(String[], false)
+        gmsh.option.setNumber("General.Verbosity", 2)
+        gmsh.option.setNumber("Mesh.MeshSizeMax", 0.2)
+        gmsh.model.occ.addDisk(0, 0, 0, 1, 1)
+        gmsh.model.occ.synchronize()
+        gmsh.model.mesh.generate(2)
+        Inti.import_mesh(; dim = 2)
+    finally
+        gmsh.finalize()
+    end
+    Ω2 = Inti.Domain(e -> Inti.geometric_dimension(e) == 2, msh2)
+    Q2 = Inti.Quadrature(msh2[Ω2]; qorder = 2)
+    @test_throws ArgumentError Inti.adaptive_correction_plan(laplace_sl, Q2; backend = CPU(), maxdist = 0.1, rtol = 1.0e-5)
 end
