@@ -11,6 +11,8 @@
       (POCL), compared with the default path
     - `profile32`: Float32 correction kernels on the GPU: tier breakdown, summary of the
       compiled code, and the device-side profile (time, threads, registers, memory per launch)
+    - `breakdown32`: cost of the components of the integrand of the first tier (geometry,
+      Lagrange basis, kernel and accumulation), with a fixed amount of work per pair
     - `rule32`, `rule32_fields`: reproducer of a crash of the CPU backend on x86, when a large
       struct is passed as a kernel argument (`rule32` is expected to crash there)
     Each stage prints a line before starting, so that a crash can be located. For the
@@ -240,7 +242,7 @@ function check_profile()
         keys, npairs = Ext._nearfield_keys(plan, Xd)
         # compiled code (captured while compiling, at the first call)
         code = compiled_code(() -> (Ext._nearfield_values(plan, Xd, keys, npairs); sync()))
-        code_report(code, r"correction_(private|scratch)")
+        code_report(code, r"correction_(private|scratch|coop)")
         # tiers: pairs converging in each tier, time with all tiers and with the first only
         _, nzval, nsub = Ext._nearfield_values(plan, Xd, keys, npairs)
         np = size(plan.el2qtags, 1)
@@ -256,6 +258,123 @@ function check_profile()
         # device-side profile
         prof = gpu_profile(() -> (Ext._nearfield_values(plan, Xd, keys, npairs); sync()))
         foreach(l -> say(first(l, 220)), device_profile_lines(prof))
+    end
+    return
+end
+
+## 3b. cost breakdown of the integrand: every pair applies the rule on the reference element and
+## on its children (a fixed number of evaluations), with the integrand reduced to the geometry
+## (element and jacobian), the geometry and the Lagrange basis, or the full integrand
+
+@kernel function ablation_kernel!(out, @Const(keys), @Const(X), @Const(els), @Const(offsets), @Const(oris), K, L, rnodes, rwh, rwl, rdom, ::Val{V}) where {V}
+    p = @index(Global, Linear)
+    rule = Ext.EmbeddedRule(rnodes, rwh, rwl, rdom)
+    T = eltype(rwh)
+    @inbounds key = keys[p]
+    i, n = Ext._pair_from_key(key)
+    @inbounds el, ori = els[n], oris[n]
+    @inbounds x = Ext._local_target(T, X[i], offsets[n])
+    f = if V === :geom
+        ŷ -> (jac = Inti.jacobian(el, ŷ); y = el(ŷ); SVector(Ext._integration_measure(jac) + y[1] + x.coords[1]))
+    elseif V === :basis
+        ŷ -> (jac = Inti.jacobian(el, ŷ); y = el(ŷ); L(ŷ) * (Ext._integration_measure(jac) + y[1] + x.coords[1]))
+    elseif V === :wide
+        # same as `basis`, times a (cheap) 3×3 matrix: as many outputs as the Stokes integrand
+        ŷ -> (jac = Inti.jacobian(el, ŷ); y = el(ŷ); M = (Ext._integration_measure(jac) + y[1] + x.coords[1]) * SMatrix{3, 3, T}(1, 2, 3, 4, 5, 6, 7, 8, 9); map(l -> M * l, L(ŷ)))
+    else
+        first(Ext._pair_integrand(key, X, els, offsets, oris, K, L, T))
+    end
+    dom = rule.domain
+    I, E = Ext._apply_rule(f, rule, dom)
+    children = Inti.HAdaptiveIntegration.default_subdivision(dom)(dom)
+    for c in 1:length(children)
+        Ic, Ec = Ext._apply_rule(f, rule, children[c])
+        I += Ic
+        E += Ec
+    end
+    @inbounds out[p] = norm(I) + E
+end
+
+# Same as `_apply_rule`, but one Lagrange basis function (output block) at a time: the integrand
+# `fk(ŷ, k)` returns the block `k`, and the squared error is accumulated block by block.
+@inline function apply_blocked(fk, rule, dom, ::Val{NB}) where {NB}
+    Φ, μ = Inti.HAdaptiveIntegration.map_from_reference(dom)
+    nodes, wh, wl = rule.nodes, rule.weights_high, rule.weights_low
+    H, Lo = length(wh), length(wl)
+    blocks = ntuple(Val(NB)) do k
+        @inbounds begin
+            v = fk(Φ(nodes[1]), k)
+            Il = wl[1] * v
+            Ih = wh[1] * v
+            for i in 2:Lo
+                v = fk(Φ(nodes[i]), k)
+                Il += wl[i] * v
+                Ih += wh[i] * v
+            end
+            for i in (Lo + 1):H
+                Ih += wh[i] * fk(Φ(nodes[i]), k)
+            end
+        end
+        (μ * Ih, sum(abs2, Ih - Il))
+    end
+    I = SVector(map(first, blocks))
+    E2 = sum(map(last, blocks))
+    return I, μ * sqrt(E2)
+end
+
+@kernel function blocked_kernel!(out, @Const(keys), @Const(X), @Const(els), @Const(offsets), @Const(oris), K, L, rnodes, rwh, rwl, rdom, ::Val{NB}) where {NB}
+    p = @index(Global, Linear)
+    rule = Ext.EmbeddedRule(rnodes, rwh, rwl, rdom)
+    T = eltype(rwh)
+    @inbounds key = keys[p]
+    i, n = Ext._pair_from_key(key)
+    @inbounds el, ori = els[n], oris[n]
+    @inbounds x = Ext._local_target(T, X[i], offsets[n])
+    fk = (ŷ, k) -> begin
+        y = el(ŷ)
+        jac = Inti.jacobian(el, ŷ)
+        ν = Inti._normal(jac, ori)
+        τ′ = Ext._integration_measure(jac)
+        M = K(x, (coords = y, normal = ν))
+        @inbounds Lk = L(ŷ)[k]
+        M * (Lk * τ′)
+    end
+    dom = rule.domain
+    I, E = apply_blocked(fk, rule, dom, Val(NB))
+    children = Inti.HAdaptiveIntegration.default_subdivision(dom)(dom)
+    for c in 1:length(children)
+        Ic, Ec = apply_blocked(fk, rule, children[c], Val(NB))
+        I += Ic
+        E += Ec
+    end
+    @inbounds out[p] = norm(I) + E
+end
+
+function check_breakdown()
+    backend = gpu_backend()
+    sync() = KA.synchronize(backend)
+    h = 0.2
+    Q = sphere_quadrature(; meshsize = h, quads = get(ENV, "INTI_DIAG_QUADS", "0") == "1")
+    X = [(coords = q.coords + s * δ * h * q.normal, normal = q.normal) for q in Q for δ in (1.0e-2, 0.1, 0.5) for s in (-1, 1)]
+    for K in (Inti.SingleLayerKernel(Inti.Laplace(; dim = 3)), Inti.SingleLayerKernel(Inti.Stokes(; μ = 1.0, dim = 3)))
+        plan = Inti.adaptive_correction_plan(K, Q; backend, T = Float32, maxdist = 2h, rtol = 1.0e-5, atol = 1.0e-6)
+        Xd = device_targets(plan, X, backend)
+        keys, npairs = Ext._nearfield_keys(plan, Xd)
+        H = length(plan.rule.weights_high)
+        nevals = H * (1 + Ext._nchildren(typeof(plan.rule.domain)))
+        out = KA.allocate(backend, Float32, npairs)
+        say("\n  ", nameof(typeof(K)), " ", nameof(typeof(K.op)), ": $npairs pairs, $nevals evaluations per pair")
+        for V in (:geom, :basis, :wide, :full)
+            run() = (ablation_kernel!(backend)(out, keys, Xd, plan.els, plan.offsets, plan.oris, plan.kernel, plan.basis, Ext._rule_fields(plan.rule)..., Val(V); ndrange = npairs); sync())
+            run()
+            t = minimum(_ -> @elapsed(run()), 1:3)
+            @printf("    %-7s %8.2f ms   (%.2f ns per evaluation)\n", V, 1.0e3 * t, 1.0e9 * t / (npairs * nevals))
+        end
+        NB = size(plan.el2qtags, 1)
+        runb() = (blocked_kernel!(backend)(out, keys, Xd, plan.els, plan.offsets, plan.oris, plan.kernel, plan.basis, Ext._rule_fields(plan.rule)..., Val(NB); ndrange = npairs); sync())
+        runb()
+        t = minimum(_ -> @elapsed(runb()), 1:3)
+        @printf("    %-7s %8.2f ms   (full integrand, one basis function at a time)\n", :blocked, 1.0e3 * t)
     end
     return
 end
@@ -303,6 +422,8 @@ elseif stage == "pocl32"
     check_correction(CPU(), Float32)
 elseif stage == "profile32"
     check_profile()
+elseif stage == "breakdown32"
+    check_breakdown()
 elseif stage == "rule32"
     check_rule(false)
 elseif stage == "rule32_fields"

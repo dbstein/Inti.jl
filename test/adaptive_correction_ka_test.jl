@@ -270,6 +270,19 @@ end
     nsub_ = Int32[-1, 0, -2, 0, -1, 0, 3, 0, -5]
     out, nfail = Ext._failed_pairs(CPU(), list, nsub_, length(list))
     @test nfail == 4 && out[1:nfail] == Int32[5, 3, 9, 1]
+    # cooperative integration (one workgroup per pair): same arithmetic as the per-thread
+    # integration, up to the contraction into fused multiply-adds by the backend compiler. With
+    # 3 basis functions, groups of 2 work-items assign two components to some work-items.
+    plan64 = Inti.adaptive_correction_plan(stokes_dl, Q; backend = CPU(), maxdist = 3h, rtol = 1.0e-8, atol = 0.0)
+    Xc = Xd[1:7:end]
+    keys, npairs = Ext._nearfield_keys(plan64, Xc)
+    c0, v0, n0 = Ext._nearfield_values(plan64, Xc, keys, npairs; cooperative = false)
+    for (gs, pb) in ((8, Ext.PRIVATE_BYTES), (2, 0))
+        c1, v1, n1 = Ext._nearfield_values(plan64, Xc, keys, npairs; cooperative = true, group_size = gs, private_bytes = pb, scratch_bytes = 2^16)
+        @test c1 == c0
+        @test maximum(norm, v1 - v0) ≤ 1.0e-7 * maximum(norm, v0)
+        @test count(n1 .!= n0) ≤ length(n0) ÷ 100
+    end
     # targets far away: empty correction
     δ0 = Inti.adaptive_correction(plan, [(coords = SVector(10.0, 10.0), normal = SVector(1.0, 0.0))])
     @test nnz(δ0) == 0 && size(δ0) == (1, length(Q))
@@ -345,6 +358,17 @@ end
         δka = Inti.adaptive_correction(iop; kw..., backend = CPU())
         @test same_pattern(δka, δref)
         @test relerr(δka, δref) < 1.0e-10
+    end
+    # cooperative integration (see the "Device API" test), with groups smaller than the number
+    # of basis functions, and most pairs integrated in the later tiers
+    if !quads
+        plan = Inti.adaptive_correction_plan(Inti.DoubleLayerKernel(stokes3), Q3; backend = CPU(), maxdist = 2h3, rtol = 1.0e-8, atol = 0.0)
+        Xc = X3[1:5:end]
+        keys, npairs = Ext._nearfield_keys(plan, Xc)
+        c0, v0, n0 = Ext._nearfield_values(plan, Xc, keys, npairs; cooperative = false)
+        c1, v1, n1 = Ext._nearfield_values(plan, Xc, keys, npairs; cooperative = true, group_size = 4, private_bytes = 0, scratch_bytes = 2^16)
+        @test c1 == c0
+        @test maximum(norm, v1 - v0) ≤ 1.0e-7 * maximum(norm, v0)
     end
     # Green's representation formula (see the 2D test), Float64 and Float32
     for op in (laplace3, stokes3)
