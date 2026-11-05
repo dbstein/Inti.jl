@@ -264,7 +264,8 @@ function (SL::SingleLayerKernel{Laplace{N}})(
     if N == 2
         v = @fastmath -log(d2) / 4 / π
     elseif N == 3
-        v = @fastmath one(d2) / sqrt(d2) / 4 / π
+        # no `@fastmath` with `sqrt`: on GPUs it may select low-accuracy approximations
+        v = inv(sqrt(d2)) * oftype(d2, inv(4π))
     else
         notimplemented()
     end
@@ -282,8 +283,8 @@ function (DL::DoubleLayerKernel{Laplace{N}})(
     if N == 2
         v = @fastmath dot(r, ny) / d2 / 2 / π
     elseif N == 3
-        id2 = @fastmath one(d2) / d2
-        v = @fastmath dot(r, ny) * id2 * sqrt(id2) / 4 / π
+        id2 = inv(d2)
+        v = dot(r, ny) * id2 * sqrt(id2) * oftype(d2, inv(4π))
     else
         notimplemented()
     end
@@ -301,8 +302,8 @@ function (ADL::AdjointDoubleLayerKernel{Laplace{N}})(
     if N == 2
         v = @fastmath -dot(r, nx) / d2 / 2 / π
     elseif N == 3
-        id2 = @fastmath one(d2) / d2
-        v = @fastmath -dot(r, nx) * id2 * sqrt(id2) / 4 / π
+        id2 = inv(d2)
+        v = -dot(r, nx) * id2 * sqrt(id2) * oftype(d2, inv(4π))
     else
         notimplemented()
     end
@@ -318,7 +319,7 @@ function (HS::HyperSingularKernel{Laplace{N}})(
     ny = normal(source)
     d2 = dot(r, r)
     tol = oftype(d2, SAME_POINT_TOLERANCE)
-    id2 = @fastmath one(d2) / d2
+    id2 = inv(d2)
     # nxᵀ(I - N*rrᵀ/d²)ny = nxdny - N*rdnx*rdny/d²
     nxdny = dot(nx, ny)
     rdnx = dot(r, nx)
@@ -326,7 +327,7 @@ function (HS::HyperSingularKernel{Laplace{N}})(
     if N == 2
         v = @fastmath id2 * (nxdny - 2 * rdnx * rdny * id2) / 2 / π
     elseif N == 3
-        v = @fastmath id2 * sqrt(id2) * (nxdny - 3 * rdnx * rdny * id2) / 4 / π
+        v = id2 * sqrt(id2) * (nxdny - 3 * rdnx * rdny * id2) * oftype(d2, inv(4π))
     else
         notimplemented()
     end
@@ -743,8 +744,8 @@ function (SL::SingleLayerKernel{<:Stokes{N}})(
         invd2 = @fastmath one(d2) / d2
         v = (γ * I + RRT * invd2) / (μ * 4 * π * (N - 1))
     elseif N == 3
-        invd = @fastmath one(d2) / sqrt(d2)
-        invd3 = @fastmath invd * invd * invd
+        invd = inv(sqrt(d2))
+        invd3 = invd * invd * invd
         v = (invd * I + RRT * invd3) / (μ * 4 * π * (N - 1))
     else
         notimplemented()
@@ -766,8 +767,8 @@ function (DL::DoubleLayerKernel{<:Stokes{N}})(
         id2 = @fastmath one(d2) / d2
         c = @fastmath id2 * id2 / π * rdny
     elseif N == 3
-        id2 = @fastmath one(d2) / d2
-        c = @fastmath 3 * id2 * id2 * sqrt(id2) / 4 / π * rdny
+        id2 = inv(d2)
+        c = 3 * id2 * id2 * sqrt(id2) * oftype(d2, inv(4π)) * rdny
     else
         notimplemented()
     end
@@ -789,8 +790,8 @@ function (ADL::AdjointDoubleLayerKernel{<:Stokes{N}})(
         id2 = @fastmath one(d2) / d2
         c = @fastmath -id2 * id2 / π * rdnx
     elseif N == 3
-        id2 = @fastmath one(d2) / d2
-        c = @fastmath -3 * id2 * id2 * sqrt(id2) / 4 / π * rdnx
+        id2 = inv(d2)
+        c = -3 * id2 * id2 * sqrt(id2) * oftype(d2, inv(4π)) * rdnx
     else
         notimplemented()
     end
@@ -874,7 +875,8 @@ function (HS::HyperSingularKernel{<:Stokes{N}})(
     ny = normal(source)
     d2 = dot(r, r)
     tol = oftype(d2, SAME_POINT_TOLERANCE)
-    invd = @fastmath one(d2) / sqrt(d2)
+    # no `@fastmath` with `sqrt`: on GPUs it may select low-accuracy approximations
+    invd = inv(sqrt(d2))
     id2 = invd * invd
     rdnx = dot(r, nx)
     rdny = dot(r, ny)
