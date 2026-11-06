@@ -930,7 +930,7 @@ function _failed_pairs(backend, list, nsub, n)
 end
 
 """
-    _nearfield_values(plan, X, keys, npairs; sort_by_cost, private_bytes, scratch_bytes, cooperative, group_size)
+    _nearfield_values(plan, X, keys, npairs; sort_by_cost, private_bytes, scratch_bytes, cooperative, cooperative_later, group_size)
 
 Compute the values (and column indices) of the CSR correction matrix, together with the
 number of subdivisions used for each pair. The adaptive integration is performed in tiers of
@@ -939,6 +939,9 @@ increasing capacity, see [`_tiers`](@ref).
 If `cooperative`, each pair is integrated by a workgroup of `group_size` work-items (see
 `_coop_refine!`) instead of a single work-item, with the same arithmetic. By default
 (`cooperative = :auto`), this is done on GPUs for integrands with many components.
+`cooperative_later` makes the same choice for the later tiers only. By default, these are
+cooperative on GPUs for all integrands: the few pairs that reach them would otherwise be
+integrated by too few work-items to occupy a large GPU.
 
 If `sort_by_cost`, the pairs of the first tier are processed in the order given by
 [`_cost_order`](@ref). This is the default on GPUs, where it reduces the divergence between
@@ -949,7 +952,7 @@ function _nearfield_values(
         plan::AdaptiveCorrectionPlan, X, keys, npairs;
         sort_by_cost = !(plan.backend isa typeof(KA.CPU())),
         private_bytes = PRIVATE_BYTES, scratch_bytes = SCRATCH_BYTES,
-        cooperative = :auto, group_size = 32,
+        cooperative = :auto, cooperative_later = :auto, group_size = 32,
     )
     backend = plan.backend
     np = size(plan.el2qtags, 1)
@@ -967,21 +970,27 @@ function _nearfield_values(
     )
     caps = _tiers(plan, IT; private_bytes)
     coop = cooperative === :auto ? _cooperative_default(backend, IT, T) : cooperative
+    coop_later = cooperative_later === :auto ? coop || !(backend isa typeof(KA.CPU())) : cooperative_later
     DOM = typeof(plan.rule.domain)
+    G = group_size
+    cvals = (Val(G), Val(VT), Val(length(plan.rule.weights_high)), Val(np), Val(np * _nentries(VT)))
     list = sort_by_cost ? _cost_order(plan, X, keys, npairs) : nothing
+    # first tier: all pairs, panels in shared memory (cooperative) or per-thread storage
     if coop
-        G = group_size
-        cvals = (Val(G), Val(VT), Val(length(plan.rule.weights_high)), Val(np), Val(np * _nentries(VT)))
-        # first tier: all pairs, panels in shared memory
         _correction_coop_kernel!(backend, G)(
             nzval, colval, nsub, list, args..., caps[1], cvals[1], Val(_capacity(DOM, caps[1])),
             cvals[2:end]...; ndrange = npairs * G,
         )
-        # later tiers: pairs that did not converge, panels in global memory
-        list, nlist = _failed_pairs(backend, list, nsub, npairs)
-        for cap in caps[2:end]
-            nlist == 0 && break
-            ncap = _capacity(DOM, cap)
+    else
+        _correction_private_kernel!(backend)(nzval, colval, nsub, list, args..., Val(caps[1]); ndrange = npairs)
+    end
+    # later tiers: pairs that did not converge, panels in global memory
+    list, nlist = _failed_pairs(backend, list, nsub, npairs)
+    store = Val(_store_integrals(IT, T))
+    for cap in caps[2:end]
+        nlist == 0 && break
+        ncap = _capacity(DOM, cap)
+        if coop_later
             batch = clamp(scratch_bytes ÷ (ncap * (sizeof(DOM) + sizeof(T))), 1, nlist)
             spanels = KA.allocate(backend, DOM, ncap, batch)
             sEs = KA.allocate(backend, T, ncap, batch)
@@ -992,29 +1001,19 @@ function _nearfield_values(
                     ndrange = nb * G,
                 )
             end
-            list, nlist = _failed_pairs(backend, list, nsub, nlist)
-        end
-        return colval, nzval, nsub
-    end
-    # first tier: all pairs, per-thread storage
-    _correction_private_kernel!(backend)(nzval, colval, nsub, list, args..., Val(caps[1]); ndrange = npairs)
-    # later tiers: pairs that did not converge, storage in global memory
-    list, nlist = _failed_pairs(backend, list, nsub, npairs)
-    store = Val(_store_integrals(IT, T))
-    for cap in caps[2:end]
-        nlist == 0 && break
-        ncap = _capacity(DOM, cap)
-        batch = clamp(scratch_bytes ÷ (ncap * _panel_bytes(DOM, T, IT)), 1, nlist)
-        spanels = KA.allocate(backend, DOM, ncap, batch)
-        sEs = KA.allocate(backend, T, ncap, batch)
-        # (one unused row if the integrals are not stored, to avoid empty allocations)
-        sIs = KA.allocate(backend, IT, _store_integrals(IT, T) ? ncap : 1, batch)
-        for offset in 0:batch:(nlist - 1)
-            nb = min(batch, nlist - offset)
-            _correction_scratch_kernel!(backend)(
-                nzval, colval, nsub, list, offset, spanels, sEs, sIs, args..., cap, store;
-                ndrange = nb,
-            )
+        else
+            batch = clamp(scratch_bytes ÷ (ncap * _panel_bytes(DOM, T, IT)), 1, nlist)
+            spanels = KA.allocate(backend, DOM, ncap, batch)
+            sEs = KA.allocate(backend, T, ncap, batch)
+            # (one unused row if the integrals are not stored, to avoid empty allocations)
+            sIs = KA.allocate(backend, IT, _store_integrals(IT, T) ? ncap : 1, batch)
+            for offset in 0:batch:(nlist - 1)
+                nb = min(batch, nlist - offset)
+                _correction_scratch_kernel!(backend)(
+                    nzval, colval, nsub, list, offset, spanels, sEs, sIs, args..., cap, store;
+                    ndrange = nb,
+                )
+            end
         end
         list, nlist = _failed_pairs(backend, list, nsub, nlist)
     end

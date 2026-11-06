@@ -284,6 +284,11 @@ end
     @test c1 == c0
     @test maximum(norm, v1 - v0) ≤ 1.0e-7 * maximum(norm, v0)
     @test count(n1 .!= n0) ≤ length(n0) ÷ 100
+    # per-thread first tier, cooperative later tiers (the default on GPUs for narrow integrands)
+    c2, v2, n2 = Ext._nearfield_values(plan64, Xc, keys, npairs; cooperative = false, cooperative_later = true, group_size = 4, private_bytes = 0, scratch_bytes = 2^16)
+    @test c2 == c0
+    @test maximum(norm, v2 - v0) ≤ 1.0e-7 * maximum(norm, v0)
+    @test count(n2 .!= n0) ≤ length(n0) ÷ 100
     # targets far away: empty correction
     δ0 = Inti.adaptive_correction(plan, [(coords = SVector(10.0, 10.0), normal = SVector(1.0, 0.0))])
     @test nnz(δ0) == 0 && size(δ0) == (1, length(Q))

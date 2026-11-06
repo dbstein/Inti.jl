@@ -21,6 +21,7 @@
     - `INTI_DIAG_QUADS=1`: quadrilaterals instead of triangles (3D)
     - `INTI_DIAG_PRIVATE_BYTES=n`: per-thread memory budget of the first tier (default 4096)
     - `INTI_DIAG_SORT=0|1`: process the pairs sorted by cost (default: on GPUs only)
+    - `INTI_DIAG_COOP_LATER=0|1`: cooperative later tiers (default: on GPUs), `profile32` only
 =#
 
 using Inti, KernelAbstractions, AcceleratedKernels, ImplicitBVH, Gmsh, StaticArrays, SparseArrays, LinearAlgebra, Printf
@@ -234,6 +235,8 @@ function check_profile()
     h = 0.2
     Q = sphere_quadrature(; meshsize = h, quads = get(ENV, "INTI_DIAG_QUADS", "0") == "1")
     X = [(coords = q.coords + s * δ * h * q.normal, normal = q.normal) for q in Q for δ in (1.0e-2, 0.1, 0.5) for s in (-1, 1)]
+    cl = get(ENV, "INTI_DIAG_COOP_LATER", "auto")
+    vkw = (; cooperative_later = cl == "auto" ? :auto : cl == "1")
     for K in (Inti.SingleLayerKernel(Inti.Laplace(; dim = 3)), Inti.SingleLayerKernel(Inti.Stokes(; μ = 1.0, dim = 3)))
         kw = (maxdist = 2h, rtol = 1.0e-5, atol = 1.0e-6)
         plan = Inti.adaptive_correction_plan(K, Q; backend, T = Float32, kw...)
@@ -241,22 +244,22 @@ function check_profile()
         say("\n  ", nameof(typeof(K)), " ", nameof(typeof(K.op)), ", Float32 integration, targets in ", eltype(eltype(plan.centers)))
         keys, npairs = Ext._nearfield_keys(plan, Xd)
         # compiled code (captured while compiling, at the first call)
-        code = compiled_code(() -> (Ext._nearfield_values(plan, Xd, keys, npairs); sync()))
+        code = compiled_code(() -> (Ext._nearfield_values(plan, Xd, keys, npairs; vkw...); sync()))
         code_report(code, r"correction_(private|scratch|coop)")
         # tiers: pairs converging in each tier, time with all tiers and with the first only
-        _, nzval, nsub = Ext._nearfield_values(plan, Xd, keys, npairs)
+        _, nzval, nsub = Ext._nearfield_values(plan, Xd, keys, npairs; vkw...)
         np = size(plan.el2qtags, 1)
         caps = Ext._tiers(plan, SVector{np, eltype(nzval)})
         ns = Array(nsub)
         counts = [count(s -> (i == 1 ? -1 : caps[i - 1]) < s ≤ caps[i], ns) for i in eachindex(caps)]
-        t_all = minimum(_ -> @elapsed((Ext._nearfield_values(plan, Xd, keys, npairs); sync())), 1:3)
+        t_all = minimum(_ -> @elapsed((Ext._nearfield_values(plan, Xd, keys, npairs; vkw...); sync())), 1:3)
         plan1 = Inti.adaptive_correction_plan(K, Q; backend, T = Float32, kw..., maxsubdiv = caps[1])
-        Ext._nearfield_values(plan1, Xd, keys, npairs)
-        t_1 = minimum(_ -> @elapsed((Ext._nearfield_values(plan1, Xd, keys, npairs); sync())), 1:3)
+        Ext._nearfield_values(plan1, Xd, keys, npairs; vkw...)
+        t_1 = minimum(_ -> @elapsed((Ext._nearfield_values(plan1, Xd, keys, npairs; vkw...); sync())), 1:3)
         say("    $npairs pairs; tiers (max subdivisions) $caps; pairs converging per tier $counts")
         @printf("    time: all tiers %.1f ms, first tier only %.1f ms (later tiers %.0f%%)\n", 1.0e3 * t_all, 1.0e3 * t_1, 100 * (t_all - t_1) / t_all)
         # device-side profile
-        prof = gpu_profile(() -> (Ext._nearfield_values(plan, Xd, keys, npairs); sync()))
+        prof = gpu_profile(() -> (Ext._nearfield_values(plan, Xd, keys, npairs; vkw...); sync()))
         foreach(l -> say(first(l, 220)), device_profile_lines(prof))
     end
     return
