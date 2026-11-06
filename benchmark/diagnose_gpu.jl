@@ -24,9 +24,10 @@
     correction stages, the following environment variables can be set:
     - `INTI_DIAG_DIM=2`: ellipse (line elements) instead of a sphere
     - `INTI_DIAG_QUADS=1`: quadrilaterals instead of triangles (3D)
-    - `INTI_DIAG_PRIVATE_BYTES=n`: per-thread memory budget of the first tier (default 4096)
+    - `INTI_DIAG_COOP=0|1`: cooperative integration (default: on GPUs)
+    - `INTI_DIAG_PRIVATE_BYTES=n`, `INTI_DIAG_SHARED_BYTES=n`: memory budget of the first tier,
+      per thread or in shared memory (cooperative integration)
     - `INTI_DIAG_SORT=0|1`: process the pairs sorted by cost (default: on GPUs only)
-    - `INTI_DIAG_COOP_LATER=0|1`: cooperative later tiers (default: on GPUs), `profile32` only
 =#
 
 using Inti, KernelAbstractions, AcceleratedKernels, ImplicitBVH, Gmsh, StaticArrays, SparseArrays, LinearAlgebra, Printf
@@ -153,11 +154,24 @@ end
 
 ## 2. one correction with a given backend and precision, compared with the default path
 
+# options of `_nearfield_values` set by the environment variables
+function values_options(backend)
+    gpu = !(backend isa typeof(CPU()))
+    flag(name, default) = haskey(ENV, name) ? ENV[name] == "1" : default
+    return (;
+        cooperative = flag("INTI_DIAG_COOP", gpu),
+        sort_by_cost = flag("INTI_DIAG_SORT", gpu),
+        private_bytes = parse(Int, get(ENV, "INTI_DIAG_PRIVATE_BYTES", string(Ext.PRIVATE_BYTES))),
+        shared_bytes = parse(Int, get(ENV, "INTI_DIAG_SHARED_BYTES", string(Ext.SHARED_BYTES))),
+    )
+end
+
+tiers(plan, IT, vkw) = Ext._tiers(plan, IT; vkw.cooperative, vkw.private_bytes, vkw.shared_bytes)
+
 function check_correction(backend, T)
     dim, quads, h, Q, X = geometry()
-    private_bytes = parse(Int, get(ENV, "INTI_DIAG_PRIVATE_BYTES", string(Ext.PRIVATE_BYTES)))
-    sort_by_cost = haskey(ENV, "INTI_DIAG_SORT") ? ENV["INTI_DIAG_SORT"] == "1" : !(backend isa typeof(CPU()))
-    say("  dim = $dim, quads = $quads, private_bytes = $private_bytes, sort_by_cost = $sort_by_cost")
+    vkw = values_options(backend)
+    say("  dim = $dim, quads = $quads, ", vkw)
     K = Inti.SingleLayerKernel(Inti.Laplace(; dim))
     kw = T == Float32 ? (maxdist = 2h, rtol = 1.0e-5, atol = 1.0e-6) : (maxdist = 2h, rtol = 1.0e-6, atol = 0.0)
     say("  default path…")
@@ -168,8 +182,8 @@ function check_correction(backend, T)
     say("  search…")
     keys, npairs = Ext._nearfield_keys(plan, Xd)
     np = size(plan.el2qtags, 1)
-    say("  integration ($npairs pairs, tiers $(Ext._tiers(plan, SVector{np, T}; private_bytes)))…")
-    colval, nzval, nsub = Ext._nearfield_values(plan, Xd, keys, npairs; sort_by_cost, private_bytes)
+    say("  integration ($npairs pairs, tiers $(tiers(plan, SVector{np, T}, vkw)))…")
+    colval, nzval, nsub = Ext._nearfield_values(plan, Xd, keys, npairs; vkw...)
     KA.synchronize(backend)
     say("  assembly…")
     rowptr = Ext._csr_rowptr(plan, keys, npairs, length(X))
@@ -240,8 +254,8 @@ function check_profile()
     h = 0.2
     Q = sphere_quadrature(; meshsize = h, quads = get(ENV, "INTI_DIAG_QUADS", "0") == "1")
     X = [(coords = q.coords + s * δ * h * q.normal, normal = q.normal) for q in Q for δ in (1.0e-2, 0.1, 0.5) for s in (-1, 1)]
-    cl = get(ENV, "INTI_DIAG_COOP_LATER", "auto")
-    vkw = (; cooperative_later = cl == "auto" ? :auto : cl == "1")
+    vkw = values_options(backend)
+    say("  ", vkw)
     for K in (Inti.SingleLayerKernel(Inti.Laplace(; dim = 3)), Inti.SingleLayerKernel(Inti.Stokes(; μ = 1.0, dim = 3)))
         kw = (maxdist = 2h, rtol = 1.0e-5, atol = 1.0e-6)
         plan = Inti.adaptive_correction_plan(K, Q; backend, T = Float32, kw...)
@@ -254,7 +268,7 @@ function check_profile()
         # tiers: pairs converging in each tier, time with all tiers and with the first only
         _, nzval, nsub = Ext._nearfield_values(plan, Xd, keys, npairs; vkw...)
         np = size(plan.el2qtags, 1)
-        caps = Ext._tiers(plan, SVector{np, eltype(nzval)})
+        caps = tiers(plan, SVector{np, eltype(nzval)}, vkw)
         ns = Array(nsub)
         counts = [count(s -> (i == 1 ? -1 : caps[i - 1]) < s ≤ caps[i], ns) for i in eachindex(caps)]
         t_all = minimum(_ -> @elapsed((Ext._nearfield_values(plan, Xd, keys, npairs; vkw...); sync())), 1:3)

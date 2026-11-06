@@ -270,25 +270,24 @@ end
     nsub_ = Int32[-1, 0, -2, 0, -1, 0, 3, 0, -5]
     out, nfail = Ext._failed_pairs(CPU(), list, nsub_, length(list))
     @test nfail == 4 && out[1:nfail] == Int32[5, 3, 9, 1]
-    # cooperative integration (one workgroup per pair): same arithmetic as the per-thread
-    # integration, up to the contraction into fused multiply-adds by the backend compiler. Groups
-    # of 4 work-items for 12 scalar components (3 basis functions, 2×2 blocks), and a minimal
-    # first tier, so that most pairs are integrated in the later tiers. (The CPU backend executes
-    # the work-items of a group sequentially: the problem is kept small.)
-    plan64 = Inti.adaptive_correction_plan(stokes_dl, Q; backend = CPU(), maxdist = 3h, rtol = 1.0e-8, atol = 0.0)
+    # cooperative integration (one workgroup per pair, the default on GPUs): same arithmetic as
+    # the per-thread integration, up to the contraction into fused multiply-adds by the backend
+    # compiler. Groups of 4 and 7 work-items, i.e. fewer than the nodes of the panels of a step
+    # and than the panels in the list, and fewer or more than the scalar components (Stokes: 12,
+    # i.e. 3 basis functions and 2×2 blocks; Laplace: 3), and a minimal first tier, so that most
+    # pairs are integrated in the later tiers. (The CPU backend executes the work-items of a group
+    # sequentially: the problem is kept small.)
     Xc = Xd[1:25:end]
-    keys, npairs = Ext._nearfield_keys(plan64, Xc)
-    c0, v0, n0 = Ext._nearfield_values(plan64, Xc, keys, npairs; cooperative = false)
-    c1, v1, n1 = Ext._nearfield_values(plan64, Xc, keys, npairs; cooperative = true, group_size = 4, private_bytes = 0, scratch_bytes = 2^16)
-    @test count(n0 .> 4) > 0 # some pairs are integrated in the later tiers
-    @test c1 == c0
-    @test maximum(norm, v1 - v0) ≤ 1.0e-7 * maximum(norm, v0)
-    @test count(n1 .!= n0) ≤ length(n0) ÷ 100
-    # per-thread first tier, cooperative later tiers (the default on GPUs for narrow integrands)
-    c2, v2, n2 = Ext._nearfield_values(plan64, Xc, keys, npairs; cooperative = false, cooperative_later = true, group_size = 4, private_bytes = 0, scratch_bytes = 2^16)
-    @test c2 == c0
-    @test maximum(norm, v2 - v0) ≤ 1.0e-7 * maximum(norm, v0)
-    @test count(n2 .!= n0) ≤ length(n0) ÷ 100
+    for (K, G) in ((stokes_dl, 4), (laplace_sl, 7))
+        plan64 = Inti.adaptive_correction_plan(K, Q; backend = CPU(), maxdist = 3h, rtol = 1.0e-8, atol = 0.0)
+        keys, npairs = Ext._nearfield_keys(plan64, Xc)
+        c0, v0, n0 = Ext._nearfield_values(plan64, Xc, keys, npairs; cooperative = false)
+        c1, v1, n1 = Ext._nearfield_values(plan64, Xc, keys, npairs; cooperative = true, group_size = G, shared_bytes = 0, scratch_bytes = 2^16)
+        @test count(n0 .> 4) > 0 # some pairs are integrated in the later tiers
+        @test c1 == c0
+        @test maximum(norm, v1 - v0) ≤ 1.0e-7 * maximum(norm, v0)
+        @test count(n1 .!= n0) ≤ length(n0) ÷ 100
+    end
     # targets far away: empty correction
     δ0 = Inti.adaptive_correction(plan, [(coords = SVector(10.0, 10.0), normal = SVector(1.0, 0.0))])
     @test nnz(δ0) == 0 && size(δ0) == (1, length(Q))
@@ -366,15 +365,19 @@ end
         @test relerr(δka, δref) < 1.0e-10
     end
     # cooperative integration (see the "Device API" test), with groups smaller than the number
-    # of basis functions, and most pairs integrated in the later tiers
-    if !quads
-        plan = Inti.adaptive_correction_plan(Inti.DoubleLayerKernel(stokes3), Q3; backend = CPU(), maxdist = 2h3, rtol = 1.0e-8, atol = 0.0)
-        Xc = X3[1:20:end]
+    # of basis functions or of scalar components, and most pairs integrated in the later tiers
+    Xc = X3[1:20:end]
+    coop_cases = quads ? ((Inti.DoubleLayerKernel(laplace3), 4),) :
+        ((Inti.DoubleLayerKernel(stokes3), 4), (Inti.SingleLayerKernel(laplace3), 7))
+    for (K, G) in coop_cases
+        plan = Inti.adaptive_correction_plan(K, Q3; backend = CPU(), maxdist = 2h3, rtol = 1.0e-8, atol = 0.0)
         keys, npairs = Ext._nearfield_keys(plan, Xc)
         c0, v0, n0 = Ext._nearfield_values(plan, Xc, keys, npairs; cooperative = false)
-        c1, v1, n1 = Ext._nearfield_values(plan, Xc, keys, npairs; cooperative = true, group_size = 4, private_bytes = 0, scratch_bytes = 2^16)
+        c1, v1, n1 = Ext._nearfield_values(plan, Xc, keys, npairs; cooperative = true, group_size = G, shared_bytes = 0, scratch_bytes = 2^16)
+        @test count(n0 .> 4) > 0
         @test c1 == c0
         @test maximum(norm, v1 - v0) ≤ 1.0e-7 * maximum(norm, v0)
+        @test count(n1 .!= n0) ≤ length(n0) ÷ 100
     end
     # Green's representation formula (see the 2D test), Float64 and Float32
     for op in (laplace3, stokes3)

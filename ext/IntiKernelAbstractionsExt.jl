@@ -641,18 +641,29 @@ end
 
 ## Cooperative integration: one workgroup of `G` work-items per pair
 #
-# For integrands with many components (e.g. Stokes kernels in 3D), accumulating all of them in
-# a single work-item exceeds the available registers. Instead, a workgroup integrates each pair:
-# the data at the nodes of the rule (kernel, Lagrange basis, integration measure) is computed in
-# parallel and stored in shared memory, and the work-item `t` accumulates the scalar components
-# `c = t, t + G, …` of the integral with the same operations, in the same order, as
-# `_apply_rule`. The error estimates and norms are computed as by `norm` (the squared norms of
-# the blocks, one per Lagrange basis function, in parallel, and their sum by the first work-item),
-# and shared with the others. The arithmetic is therefore the same as in
-# `_adaptive_integrate`/`_refine!` (without stored panel integrals): the results are identical
-# (e.g. on Metal), up to the contraction of operations into fused multiply-adds, which backend
-# compilers may perform differently in the two kernels (e.g. the CPU backend). All the
-# work-items take the same branches, as required by the barriers.
+# On GPUs, the adaptive integration of each pair is performed by a workgroup, with all its
+# state in shared memory: the rule, the panels of the current refinement step, the data at
+# their quadrature nodes, the integrals over them, the running integral and error estimate, and
+# the list of panels (in the later tiers, in global memory). A work-item holds only the data of
+# one quadrature node at a time, so that no array is indexed dynamically in its private memory
+# (which GPU compilers place in slow, uncoalesced "local" memory). Each refinement step
+# processes the panel to subdivide and its children together:
+#   1. the data at the nodes of all the panels (kernel, Lagrange basis, integration measure) are
+#      computed in parallel;
+#   2. each scalar component of the integral over each panel is accumulated by one work-item,
+#      with the same operations, in the same order, as `_apply_rule`;
+#   3. the running integral is updated as in `_refine!` (one work-item per component), and the
+#      error estimates are computed as by `norm` (the squared norms of the blocks, one per
+#      Lagrange basis function, in parallel, and their sum in order);
+#   4. the first work-item updates the error estimate and the list of panels;
+#   5. the panel with the largest error estimate is found by a parallel search, which returns
+#      the first such panel, as the linear search of `_refine!`.
+# The arithmetic is therefore the same as in `_adaptive_integrate`/`_refine!` (without stored
+# panel integrals): the results are identical (e.g. on Metal), up to the contraction of
+# operations into fused multiply-adds, which backend compilers may perform differently in the
+# two kernels (e.g. the CPU backend). (If an error estimate is NaN, the search may select a
+# different panel, but the pair does not converge either way.) All the work-items take the
+# same branches, as required by the barriers.
 
 # scalar entries of a block (value of the kernel times a Lagrange basis function)
 _nentries(::Type{V}) where {V <: Number} = 1
@@ -662,144 +673,230 @@ _nentries(::Type{V}) where {V <: StaticArray} = length(V)
 @inline _from_entries(::Type{V}, f) where {V <: Number} = f(1)
 @inline _from_entries(::Type{V}, f) where {V <: StaticArray} = V(ntuple(f, Val(length(V))))
 
-# block `k` of a vector of blocks of type `V` whose scalar components are stored in `s`
-@inline _block(::Type{V}, s, k) where {V} = _from_entries(V, e -> @inbounds(s[(k - 1) * _nentries(V) + e]))
-@inline _blocks(::Type{V}, s, ::Val{NP}) where {V, NP} = SVector{NP}(ntuple(k -> _block(V, s, k), Val(NP)))
+# block `k` of the vector of blocks of type `V` whose scalar components are stored in `s[:, q]`
+@inline _block(::Type{V}, s, k, q) where {V} = _from_entries(V, e -> @inbounds(s[(k - 1) * _nentries(V) + e, q]))
 
-# `norm` of the vector of `NP` blocks of type `V` whose scalar components are stored in `s`
-# (shared memory), returned to all the work-items. Same result as `norm` on a `SVector` of
-# blocks: the square root of the sum of the squared norms of the blocks, in order, unless it is
-# zero or not finite (in which case `norm` itself is used, for its rescaling).
-@inline function _coop_norm_of(s, t, ::Val{G}, ::Val{NP}, ::Type{V}, sB, sS, slot) where {G, NP, V}
-    @inbounds for k in t:G:NP
-        sB[k] = LinearAlgebra.norm_sqr(_block(V, s, k))
-    end
-    KA.@synchronize()
-    if t == 1
-        @inbounds begin
-            acc = sB[1]
-            for k in 2:NP
-                acc += sB[k]
-            end
-            l = sqrt(acc)
-            if !(zero(l) < l && isfinite(l))
-                l = norm(_blocks(V, s, Val(NP)))
-            end
-            sS[slot] = l
+# `norm` of the vector of `NP` blocks of type `V` stored in `s[:, q]`, given the squared norms
+# of its blocks in `sB[:, qb]`. Same result as `norm` on a `SVector` of blocks: the square root
+# of the sum of the squared norms of the blocks, in order, unless it is zero or not finite (in
+# which case `norm` itself is used, for its rescaling).
+@inline function _norm_of_blocks(s, q, sB, qb, ::Val{NP}, ::Type{V}) where {NP, V}
+    @inbounds begin
+        acc = sB[1, qb]
+        for k in 2:NP
+            acc += sB[k, qb]
         end
     end
-    KA.@synchronize()
-    return @inbounds sS[slot]
+    l = sqrt(acc)
+    if !(zero(l) < l && isfinite(l))
+        l = norm(SVector{NP}(ntuple(k -> _block(V, s, k, q), Val(NP))))
+    end
+    return l
 end
 
-# Integral over `dom` (scalar components owned by the work-item `t`, stored in `Iown`), and
-# error estimate (returned to all the work-items). Same as `_apply_rule`.
-@inline function _coop_apply!(Iown, node, rule::EmbeddedRule{H, Lo}, dom, t, g::Val{G}, np::Val{NP}, ::Type{V}, sM, sL, sτ, sC, sB, sS) where {H, Lo, G, NP, V}
-    Φ, μ = HAdaptiveIntegration.map_from_reference(dom)
-    nodes, wh, wl = rule.nodes, rule.weights_high, rule.weights_low
+# shared memory of the cooperative kernels, for blocks of type `VT`, `NP` Lagrange basis
+# functions, panels of type `DOM`, and a rule with `H` nodes in dimension `D` (`LO` of them for
+# the low-order rule). A refinement step processes `NC + 1` panels (the panel to subdivide and
+# its `NC` children).
+macro _coop_shared(T, VT, NP, DOM, H, LO, D, G)
+    return esc(
+        quote
+            # the rule (coordinates of the nodes, weights)
+            sX = KA.@localmem $T ($D, $H)
+            sWh = KA.@localmem $T ($H,)
+            sWl = KA.@localmem $T ($LO,)
+            # the panels of the current step
+            sDom = KA.@localmem $DOM (_nchildren($DOM) + 1,)
+            # data at their nodes: entries of the kernel, Lagrange basis, integration measure
+            sM = KA.@localmem $T (_nentries($VT), (_nchildren($DOM) + 1) * $H)
+            sL = KA.@localmem $T ($NP, (_nchildren($DOM) + 1) * $H)
+            sτ = KA.@localmem $T ((_nchildren($DOM) + 1) * $H,)
+            # integrals over the panels, and differences between the two rules (scalar components)
+            sIp = KA.@localmem $T ($NP * _nentries($VT), _nchildren($DOM) + 1)
+            sDp = KA.@localmem $T ($NP * _nentries($VT), _nchildren($DOM) + 1)
+            # squared norms of the blocks of the differences (one column per panel) and of the
+            # running integral (last column), and error estimates over the panels
+            sB = KA.@localmem $T ($NP, _nchildren($DOM) + 2)
+            sEp = KA.@localmem $T (_nchildren($DOM) + 1,)
+            # running integral (scalar components) and error estimate
+            sI = KA.@localmem $T ($NP * _nentries($VT), 1)
+            sE = KA.@localmem $T (1,)
+            # number of panels, number of subdivisions, panel to subdivide, convergence flag
+            sN = KA.@localmem Int32 (4,)
+            # partial results of the search of the panel with the largest error estimate
+            sArgE = KA.@localmem $T ($G,)
+            sArgK = KA.@localmem Int32 ($G,)
+            sh = (; sX, sWh, sWl, sDom, sM, sL, sτ, sIp, sDp, sB, sEp, sI, sE, sN, sArgE, sArgK)
+        end
+    )
+end
+
+# the rule in shared memory (by the first work-item; static indices only)
+@inline function _coop_load_rule!(sh, rule::EmbeddedRule{H, LO, D}) where {H, LO, D}
+    ntuple(Val(H)) do i
+        x = rule.nodes[i]
+        ntuple(d -> (@inbounds sh.sX[d, i] = x[d]; nothing), Val(D))
+        @inbounds sh.sWh[i] = rule.weights_high[i]
+        nothing
+    end
+    ntuple(i -> (@inbounds sh.sWl[i] = rule.weights_low[i]; nothing), Val(LO))
+    return
+end
+
+# One step of the cooperative integration of a pair: the `npan` panels in `sh.sDom` are
+# integrated, and the running integral, error estimate and list of panels are updated. If
+# `npan == 1`, the panel is the reference domain (first step); otherwise, the panels are the
+# panel `sh.sN[3]` of the list, which is replaced, and its children.
+@inline function _coop_step!(panels, Es, node, rtol, atol, npan, t, ::Val{G}, ::Val{NP}, ::Type{V}, ::Val{H}, ::Val{LO}, ::Val{D}, ::Val{NC}, sh) where {G, NP, V, H, LO, D, NC}
     NE = _nentries(V)
-    # node data, stored as scalars (each work-item then reads the entries it needs)
-    @inbounds for i in t:G:H
-        M, Lv, τ′ = node(Φ(nodes[i]))
+    NCOMP = NP * NE
+    (; sX, sWh, sWl, sDom, sM, sL, sτ, sIp, sDp, sB, sEp, sI, sE, sN) = sh
+    # 1. data at the nodes of the panels: work item `w` is the node `i` of the panel `q`
+    @inbounds for w in t:G:(npan * H)
+        q, i = divrem(w - 1, H) .+ 1
+        Φ, _ = HAdaptiveIntegration.map_from_reference(sDom[q])
+        M, Lv, τ′ = node(Φ(SVector{D}(ntuple(d -> sX[d, i], Val(D)))))
         for e in 1:NE
-            sM[e, i] = _entry(M, e)
+            sM[e, w] = _entry(M, e)
         end
         for k in 1:NP
-            sL[k, i] = Lv[k]
+            sL[k, w] = Lv[k]
         end
-        sτ[i] = τ′
+        sτ[w] = τ′
     end
     KA.@synchronize()
-    @inbounds for (j, c) in enumerate(t:G:(NP * NE))
+    # 2. integrals over the panels: work item `w` is the component `c` (entry `e` of block `k`)
+    # of the panel `q`, accumulated as in `_apply_rule`
+    @inbounds for w in t:G:(npan * NCOMP)
+        q, c = divrem(w - 1, NCOMP) .+ 1
         k, e = divrem(c - 1, NE) .+ 1
-        v = (sM[e, 1] * sL[k, 1]) * sτ[1]
-        Il = wl[1] * v
-        Ih = wh[1] * v
-        for i in 2:Lo
-            v = (sM[e, i] * sL[k, i]) * sτ[i]
-            Il += wl[i] * v
-            Ih += wh[i] * v
+        o = (q - 1) * H
+        v = (sM[e, o + 1] * sL[k, o + 1]) * sτ[o + 1]
+        Il = sWl[1] * v
+        Ih = sWh[1] * v
+        for i in 2:LO
+            v = (sM[e, o + i] * sL[k, o + i]) * sτ[o + i]
+            Il += sWl[i] * v
+            Ih += sWh[i] * v
         end
-        for i in (Lo + 1):H
-            Ih += wh[i] * ((sM[e, i] * sL[k, i]) * sτ[i])
+        for i in (LO + 1):H
+            Ih += sWh[i] * ((sM[e, o + i] * sL[k, o + i]) * sτ[o + i])
         end
-        Iown[j] = μ * Ih
-        sC[c] = Ih - Il
+        _, μ = HAdaptiveIntegration.map_from_reference(sDom[q])
+        sIp[c, q] = μ * Ih
+        sDp[c, q] = Ih - Il
     end
     KA.@synchronize()
-    return μ * _coop_norm_of(sC, t, g, np, V, sB, sS, 1)
-end
-
-# `norm` of the integral whose scalar components are distributed among the work-items
-@inline function _coop_norm(Iown, t, g::Val{G}, np::Val{NP}, ::Type{V}, sC, sB, sS) where {G, NP, V}
-    @inbounds for (j, c) in enumerate(t:G:(NP * _nentries(V)))
-        sC[c] = Iown[j]
+    # 3. squared norms of the blocks of the differences between the two rules; running integral,
+    # updated as in `_refine!`: `I - I_parent + I_child₁ + … + I_childₙ`
+    @inbounds for w in t:G:(npan * NP)
+        q, k = divrem(w - 1, NP) .+ 1
+        sB[k, q] = LinearAlgebra.norm_sqr(_block(V, sDp, k, q))
+    end
+    @inbounds for c in t:G:NCOMP
+        if npan == 1
+            sI[c, 1] = sIp[c, 1]
+        else
+            acc = sI[c, 1] - sIp[c, 1]
+            for q in 2:npan
+                acc += sIp[c, q]
+            end
+            sI[c, 1] = acc
+        end
     end
     KA.@synchronize()
-    return _coop_norm_of(sC, t, g, np, V, sB, sS, 2)
+    # error estimates over the panels, and squared norms of the blocks of the running integral
+    @inbounds for q in t:G:npan
+        _, μ = HAdaptiveIntegration.map_from_reference(sDom[q])
+        sEp[q] = μ * _norm_of_blocks(sDp, q, sB, q, Val(NP), V)
+    end
+    @inbounds for k in t:G:NP
+        sB[k, NC + 2] = LinearAlgebra.norm_sqr(_block(V, sI, k, 1))
+    end
+    KA.@synchronize()
+    # 4. error estimate and list of panels, as in `_refine!` (the first child replaces its
+    # parent, the others are appended), and convergence test
+    if t == 1
+        @inbounds begin
+            if npan == 1
+                E = sEp[1]
+                panels[1], Es[1] = sDom[1], E
+                npanels, nsubdiv = 1, 0
+            else
+                k = Int(sN[3])
+                E = sE[1]
+                npanels, nsubdiv = Int(sN[1]), Int(sN[2])
+                E -= Es[k]
+                for c in 1:NC
+                    Ec = sEp[c + 1]
+                    E += Ec
+                    slot = c == 1 ? k : npanels + c - 1
+                    panels[slot], Es[slot] = sDom[c + 1], Ec
+                end
+                npanels += NC - 1
+                nsubdiv += 1
+            end
+            converged = (E ≤ atol) || (E ≤ rtol * _norm_of_blocks(sI, 1, sB, NC + 2, Val(NP), V))
+            sE[1] = E
+            sN[1], sN[2], sN[4] = npanels, nsubdiv, converged
+        end
+    end
+    KA.@synchronize()
+    return
 end
 
-# Same as `_refine!` (without stored panel integrals), with the panels and their errors stored in
-# `panels` and `Es` (shared or global memory), written by the first work-item.
-@inline function _coop_refine!(panels, Es, Iown, node, rule::EmbeddedRule, rtol, atol, maxsubdiv, t, g::Val, np::Val, ::Type{V}, sM, sL, sτ, sC, sB, sS) where {V}
+# Cooperative counterpart of `_adaptive_integrate`/`_refine!`, with the panels and their error
+# estimates stored in `panels` and `Es` (shared or global memory). The integral is left in
+# `sh.sI`. Returns the number of subdivisions and whether the tolerance was met.
+@inline function _coop_integrate!(panels, Es, node, rule::EmbeddedRule{H, LO, D}, rtol::T, atol, maxsubdiv, t, g::Val{G}, np::Val, ::Type{V}, sh) where {H, LO, D, T, G, V}
     dom₀ = rule.domain
     NC = _nchildren(typeof(dom₀))
     subdivide = HAdaptiveIntegration.default_subdivision(dom₀)
-    shared = (sM, sL, sτ, sC, sB, sS)
-    E = _coop_apply!(Iown, node, rule, dom₀, t, g, np, V, shared...)
+    cvals = (g, np, V, Val(H), Val(LO), Val(D), Val(NC), sh)
     if t == 1
-        @inbounds panels[1], Es[1] = dom₀, E
-    end
-    tmp = similar(Iown)
-    npanels = 1
-    nsubdiv = 0
-    converged = (E ≤ atol) || (E ≤ rtol * _coop_norm(Iown, t, g, np, V, sC, sB, sS))
-    @inbounds while !converged && nsubdiv < maxsubdiv
-        KA.@synchronize() # the panels and errors written by the first work-item are visible
-        # find the panel with the largest error
-        k = 1
-        Emax = Es[1]
-        for m in 2:npanels
-            if Es[m] > Emax
-                k, Emax = m, Es[m]
-            end
-        end
-        dom = panels[k]
-        _coop_apply!(tmp, node, rule, dom, t, g, np, V, shared...) # integral over `dom`
-        for j in eachindex(Iown)
-            Iown[j] -= tmp[j]
-        end
-        E -= Emax
-        children = subdivide(dom)
-        for c in 1:NC
-            Ec = _coop_apply!(tmp, node, rule, children[c], t, g, np, V, shared...)
-            for j in eachindex(Iown)
-                Iown[j] += tmp[j]
-            end
-            E += Ec
-            # the first child replaces its parent, the others are appended
-            if t == 1
-                slot = c == 1 ? k : npanels + c - 1
-                panels[slot], Es[slot] = children[c], Ec
-            end
-        end
-        npanels += NC - 1
-        nsubdiv += 1
-        converged = (E ≤ atol) || (E ≤ rtol * _coop_norm(Iown, t, g, np, V, sC, sB, sS))
-    end
-    return nsubdiv, converged
-end
-
-# Cooperative counterpart of `_write_pair!`: the blocks are gathered in shared memory, and the
-# work-item `t` writes the blocks `k = t, t + G, …`.
-@inline function _coop_write_pair!(nzval, colval, nsub, p, Iown, nb, converged, x, n, K, ynodes, wnodes, el2qtags, t, ::Val{G}, ::Val{NP}, ::Type{V}, sC) where {G, NP, V}
-    @inbounds for (j, c) in enumerate(t:G:(NP * _nentries(V)))
-        sC[c] = Iown[j]
+        _coop_load_rule!(sh, rule)
+        @inbounds sh.sDom[1] = dom₀
     end
     KA.@synchronize()
+    _coop_step!(panels, Es, node, rtol, atol, 1, t, cvals...)
+    @inbounds while true
+        npanels, nsubdiv = Int(sh.sN[1]), Int(sh.sN[2])
+        (sh.sN[4] != 0 || nsubdiv ≥ maxsubdiv) && break
+        # 5. panel with the largest error estimate (the first one, as in `_refine!`): work-item
+        # `t` searches the panels `t, t + G, …`, then the first work-item combines the results
+        kt, Et = 0, zero(T)
+        for m in t:G:npanels
+            if kt == 0 || Es[m] > Et
+                kt, Et = m, Es[m]
+            end
+        end
+        sh.sArgK[t], sh.sArgE[t] = kt, Et
+        KA.@synchronize()
+        if t == 1
+            k, Emax = Int(sh.sArgK[1]), sh.sArgE[1]
+            for u in 2:min(G, npanels)
+                ku, Eu = Int(sh.sArgK[u]), sh.sArgE[u]
+                if Eu > Emax || (!(Emax > Eu) && ku < k)
+                    k, Emax = ku, Eu
+                end
+            end
+            sh.sN[3] = k
+            dom = panels[k]
+            sh.sDom[1] = dom
+            children = subdivide(dom)
+            ntuple(c -> (sh.sDom[c + 1] = children[c]; nothing), Val(NC))
+        end
+        KA.@synchronize()
+        _coop_step!(panels, Es, node, rtol, atol, NC + 1, t, cvals...)
+    end
+    return Int(sh.sN[2]), sh.sN[4] != 0
+end
+
+# Cooperative counterpart of `_write_pair!`: the work-item `t` writes the blocks `k = t, t + G, …`.
+@inline function _coop_write_pair!(nzval, colval, nsub, p, sI, nb, converged, x, n, K, ynodes, wnodes, el2qtags, t, ::Val{G}, ::Val{NP}, ::Type{V}) where {G, NP, V}
     @inbounds for k in t:G:NP
         idx = NP * (p - 1) + k
-        nzval[idx] = _block(V, sC, k) - K(x, ynodes[k, n]) * wnodes[k, n]
+        nzval[idx] = _block(V, sI, k, 1) - K(x, ynodes[k, n]) * wnodes[k, n]
         colval[idx] = el2qtags[k, n]
     end
     if t == 1
@@ -808,41 +905,34 @@ end
     return
 end
 
-# shared memory of the cooperative kernels: data at the nodes, scalar components, squared norms
-# of the blocks, and scalars
-macro _coop_shared(VT, T, H, NP, NCOMP)
-    return esc(
-        quote
-            sM = KA.@localmem $T (_nentries($VT), $H)
-            sL = KA.@localmem $T ($NP, $H)
-            sτ = KA.@localmem $T ($H,)
-            sC = KA.@localmem $T ($NCOMP,)
-            sB = KA.@localmem $T ($NP,)
-            sS = KA.@localmem $T (2,)
-        end
-    )
+# integration of the pair `p` by the workgroup, and output
+@inline function _coop_correction!(nzval, colval, nsub, p, panels, Es, keys, X, els, offsets, oris, ynodes, wnodes, el2qtags, K, L, rule, rtol::T, atol, maxsubdiv, t, g, np, ::Type{V}, sh) where {T, V}
+    @inbounds x, el, ori, n = _pair_data(keys[p], X, els, offsets, oris, T)
+    node = ŷ -> _node_data(K, L, x, el, ori, ŷ)
+    nb, converged = _coop_integrate!(panels, Es, node, rule, rtol, atol, maxsubdiv, t, g, np, V, sh)
+    _coop_write_pair!(nzval, colval, nsub, p, sh.sI, nb, converged, x, n, K, ynodes, wnodes, el2qtags, t, g, np, V)
+    return
 end
 
 # First tier: panels stored in shared memory (`CAPP` panels).
 @kernel function _correction_coop_kernel!(
         nzval, colval, nsub, @Const(list), @Const(keys), @Const(X), @Const(els),
         @Const(offsets), @Const(oris), @Const(ynodes), @Const(wnodes), @Const(el2qtags),
-        K, L, rnodes, rwh, rwl, rdomain, rtol::T, atol, maxsubdiv,
-        g::Val{G}, ::Val{CAPP}, ::Val{VT}, ::Val{H}, np::Val{NP}, ::Val{NCOMP},
-    ) where {T, G, CAPP, VT, H, NP, NCOMP}
+        K, L, rnodes::SVector{H, SVector{D, T}}, rwh, rwl::SVector{LO}, rdomain::DOM, rtol::T,
+        atol, maxsubdiv, g::Val{G}, ::Val{CAPP}, ::Val{VT}, np::Val{NP},
+    ) where {H, D, T, LO, DOM, G, CAPP, VT, NP}
     # (the shared memory is declared with type parameters: `@localmem` declarations are hoisted)
     gid = @index(Group, Linear)
     t = @index(Local, Linear)
-    rule = EmbeddedRule(rnodes, rwh, rwl, rdomain)
-    @_coop_shared VT T H NP NCOMP
-    panels = KA.@localmem typeof(rdomain) (CAPP,)
+    @_coop_shared T VT NP DOM H LO D G
+    panels = KA.@localmem DOM (CAPP,)
     Es = KA.@localmem T (CAPP,)
+    rule = EmbeddedRule(rnodes, rwh, rwl, rdomain)
     @inbounds p = isnothing(list) ? gid : Int(list[gid])
-    @inbounds x, el, ori, n = _pair_data(keys[p], X, els, offsets, oris, T)
-    node = ŷ -> _node_data(K, L, x, el, ori, ŷ)
-    Iown = MVector{cld(NCOMP, G), T}(undef)
-    nb, converged = _coop_refine!(panels, Es, Iown, node, rule, rtol, atol, maxsubdiv, t, g, np, VT, sM, sL, sτ, sC, sB, sS)
-    _coop_write_pair!(nzval, colval, nsub, p, Iown, nb, converged, x, n, K, ynodes, wnodes, el2qtags, t, g, np, VT, sC)
+    _coop_correction!(
+        nzval, colval, nsub, p, panels, Es, keys, X, els, offsets, oris, ynodes, wnodes,
+        el2qtags, K, L, rule, rtol, atol, maxsubdiv, t, g, np, VT, sh,
+    )
 end
 
 # Later tiers: panels stored in global memory, one column of the scratch arrays per workgroup;
@@ -850,46 +940,47 @@ end
 @kernel function _correction_coop_scratch_kernel!(
         nzval, colval, nsub, @Const(list), offset, spanels, sEs, @Const(keys), @Const(X),
         @Const(els), @Const(offsets), @Const(oris), @Const(ynodes), @Const(wnodes),
-        @Const(el2qtags), K, L, rnodes, rwh, rwl, rdomain, rtol::T, atol, maxsubdiv,
-        g::Val{G}, ::Val{VT}, ::Val{H}, np::Val{NP}, ::Val{NCOMP},
-    ) where {T, G, VT, H, NP, NCOMP}
+        @Const(el2qtags), K, L, rnodes::SVector{H, SVector{D, T}}, rwh, rwl::SVector{LO},
+        rdomain::DOM, rtol::T, atol, maxsubdiv, g::Val{G}, ::Val{VT}, np::Val{NP},
+    ) where {H, D, T, LO, DOM, G, VT, NP}
     gid = @index(Group, Linear)
     t = @index(Local, Linear)
+    @_coop_shared T VT NP DOM H LO D G
     rule = EmbeddedRule(rnodes, rwh, rwl, rdomain)
-    @_coop_shared VT T H NP NCOMP
     @inbounds p = Int(list[offset + gid])
-    @inbounds x, el, ori, n = _pair_data(keys[p], X, els, offsets, oris, T)
-    node = ŷ -> _node_data(K, L, x, el, ori, ŷ)
-    Iown = MVector{cld(NCOMP, G), T}(undef)
-    nb, converged = _coop_refine!(
-        view(spanels, :, gid), view(sEs, :, gid), Iown, node, rule, rtol, atol, maxsubdiv, t, g, np,
-        VT, sM, sL, sτ, sC, sB, sS,
+    _coop_correction!(
+        nzval, colval, nsub, p, view(spanels, :, gid), view(sEs, :, gid), keys, X, els,
+        offsets, oris, ynodes, wnodes, el2qtags, K, L, rule, rtol, atol, maxsubdiv, t, g, np,
+        VT, sh,
     )
-    _coop_write_pair!(nzval, colval, nsub, p, Iown, nb, converged, x, n, K, ynodes, wnodes, el2qtags, t, g, np, VT, sC)
 end
 
 # per-thread memory budget (bytes) for the panels of the first tier
 const PRIVATE_BYTES = 4096
+# shared memory budget (bytes) for the panels of the first tier of the cooperative integration
+const SHARED_BYTES = 2048
 # global memory budget (bytes) for the panels of the later tiers
 const SCRATCH_BYTES = 2^30
 
 """
-    _tiers(plan, IT; private_bytes = PRIVATE_BYTES)
+    _tiers(plan, IT; cooperative = false, private_bytes = PRIVATE_BYTES, shared_bytes = SHARED_BYTES)
 
 Capacities (maximum numbers of subdivisions) of the successive tiers of the adaptive
-integration, for integrals of type `IT`. All the pairs are first integrated with per-thread
-storage for `caps[1]` subdivisions, chosen so that it fits in `private_bytes`. The pairs that
+integration, for integrals of type `IT`. All the pairs are first integrated with the panels
+stored in per-thread arrays (or, if `cooperative`, in shared memory) for `caps[1]`
+subdivisions, chosen so that they fit in `private_bytes` (or `shared_bytes`). The pairs that
 did not converge are then integrated again from scratch with storage in global memory, with
 capacities increasing by a factor 8 up to `maxsubdiv`. Since the algorithm is deterministic,
 the result for a pair does not depend on the tier in which it converges.
 """
-function _tiers(plan::AdaptiveCorrectionPlan, IT; private_bytes = PRIVATE_BYTES)
+function _tiers(plan::AdaptiveCorrectionPlan, IT; cooperative = false, private_bytes = PRIVATE_BYTES, shared_bytes = SHARED_BYTES)
     T = _float_type(plan)
     DOM = typeof(plan.rule.domain)
-    pbytes = _panel_bytes(DOM, T, IT)
+    pbytes = cooperative ? sizeof(DOM) + sizeof(T) : _panel_bytes(DOM, T, IT)
+    budget = cooperative ? shared_bytes : private_bytes
     maxsubdiv = _val(plan.maxsubdiv)
     cap = 4
-    while 2cap ≤ maxsubdiv && _capacity(DOM, 2cap) * pbytes ≤ private_bytes
+    while 2cap ≤ maxsubdiv && _capacity(DOM, 2cap) * pbytes ≤ budget
         cap *= 2
     end
     caps = [min(cap, maxsubdiv)]
@@ -930,18 +1021,16 @@ function _failed_pairs(backend, list, nsub, n)
 end
 
 """
-    _nearfield_values(plan, X, keys, npairs; sort_by_cost, private_bytes, scratch_bytes, cooperative, cooperative_later, group_size)
+    _nearfield_values(plan, X, keys, npairs; sort_by_cost, cooperative, group_size, private_bytes, shared_bytes, scratch_bytes)
 
 Compute the values (and column indices) of the CSR correction matrix, together with the
 number of subdivisions used for each pair. The adaptive integration is performed in tiers of
 increasing capacity, see [`_tiers`](@ref).
 
-If `cooperative`, each pair is integrated by a workgroup of `group_size` work-items (see
-`_coop_refine!`) instead of a single work-item, with the same arithmetic. By default
-(`cooperative = :auto`), this is done on GPUs for integrands with many components.
-`cooperative_later` makes the same choice for the later tiers only. By default, these are
-cooperative on GPUs for all integrands: the few pairs that reach them would otherwise be
-integrated by too few work-items to occupy a large GPU.
+If `cooperative` (the default on GPUs), each pair is integrated by a workgroup of `group_size`
+work-items (see `_coop_integrate!`) instead of a single work-item, with the same arithmetic.
+The CPU backend executes the work-items of a workgroup sequentially, so that the per-thread
+integration is preferable there.
 
 If `sort_by_cost`, the pairs of the first tier are processed in the order given by
 [`_cost_order`](@ref). This is the default on GPUs, where it reduces the divergence between
@@ -951,8 +1040,8 @@ target and neighboring elements are adjacent) is more cache-friendly.
 function _nearfield_values(
         plan::AdaptiveCorrectionPlan, X, keys, npairs;
         sort_by_cost = !(plan.backend isa typeof(KA.CPU())),
-        private_bytes = PRIVATE_BYTES, scratch_bytes = SCRATCH_BYTES,
-        cooperative = :auto, cooperative_later = :auto, group_size = 32,
+        cooperative = !(plan.backend isa typeof(KA.CPU())), group_size = 32,
+        private_bytes = PRIVATE_BYTES, shared_bytes = SHARED_BYTES, scratch_bytes = SCRATCH_BYTES,
     )
     backend = plan.backend
     np = size(plan.el2qtags, 1)
@@ -968,18 +1057,15 @@ function _nearfield_values(
         keys, X, plan.els, plan.offsets, plan.oris, plan.ynodes, plan.wnodes, plan.el2qtags,
         plan.kernel, plan.basis, _rule_fields(plan.rule)..., plan.rtol, plan.atol,
     )
-    caps = _tiers(plan, IT; private_bytes)
-    coop = cooperative === :auto ? _cooperative_default(backend, IT, T) : cooperative
-    coop_later = cooperative_later === :auto ? coop || !(backend isa typeof(KA.CPU())) : cooperative_later
+    caps = _tiers(plan, IT; cooperative, private_bytes, shared_bytes)
     DOM = typeof(plan.rule.domain)
     G = group_size
-    cvals = (Val(G), Val(VT), Val(length(plan.rule.weights_high)), Val(np), Val(np * _nentries(VT)))
     list = sort_by_cost ? _cost_order(plan, X, keys, npairs) : nothing
     # first tier: all pairs, panels in shared memory (cooperative) or per-thread storage
-    if coop
+    if cooperative
         _correction_coop_kernel!(backend, G)(
-            nzval, colval, nsub, list, args..., caps[1], cvals[1], Val(_capacity(DOM, caps[1])),
-            cvals[2:end]...; ndrange = npairs * G,
+            nzval, colval, nsub, list, args..., caps[1], Val(G), Val(_capacity(DOM, caps[1])),
+            Val(VT), Val(np); ndrange = npairs * G,
         )
     else
         _correction_private_kernel!(backend)(nzval, colval, nsub, list, args..., Val(caps[1]); ndrange = npairs)
@@ -990,15 +1076,15 @@ function _nearfield_values(
     for cap in caps[2:end]
         nlist == 0 && break
         ncap = _capacity(DOM, cap)
-        if coop_later
+        if cooperative
             batch = clamp(scratch_bytes ÷ (ncap * (sizeof(DOM) + sizeof(T))), 1, nlist)
             spanels = KA.allocate(backend, DOM, ncap, batch)
             sEs = KA.allocate(backend, T, ncap, batch)
             for offset in 0:batch:(nlist - 1)
                 nb = min(batch, nlist - offset)
                 _correction_coop_scratch_kernel!(backend, G)(
-                    nzval, colval, nsub, list, offset, spanels, sEs, args..., cap, cvals...;
-                    ndrange = nb * G,
+                    nzval, colval, nsub, list, offset, spanels, sEs, args..., cap, Val(G),
+                    Val(VT), Val(np); ndrange = nb * G,
                 )
             end
         else
@@ -1018,15 +1104,6 @@ function _nearfield_values(
         list, nlist = _failed_pairs(backend, list, nsub, nlist)
     end
     return colval, nzval, nsub
-end
-
-# Whether to use the cooperative integration by default: on GPUs, for integrands with many
-# components (the same criterion as for storing the integrals over the panels). On Metal, for
-# Stokes kernels in 3D, it is about 3× faster than the per-thread integration, and slightly
-# slower for the Laplace kernels. The CPU backend executes the work-items of a workgroup
-# sequentially, so that the per-thread integration is preferable there.
-function _cooperative_default(backend, ::Type{IT}, ::Type{T}) where {IT, T}
-    return !(backend isa typeof(KA.CPU())) && !_store_integrals(IT, T)
 end
 
 function _check_convergence(plan::AdaptiveCorrectionPlan, nsub)
