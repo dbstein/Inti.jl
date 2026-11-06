@@ -11,6 +11,11 @@
       (POCL), compared with the default path
     - `profile32`: Float32 correction kernels on the GPU: tier breakdown, summary of the
       compiled code, and the device-side profile (time, threads, registers, memory per launch)
+    - `capture32` (Metal only): the Float32 corrections of `profile32`, recorded as GPU frame
+      captures (`capture_laplace_N.gputrace` and `capture_stokes_N.gputrace`, in the current
+      directory) to open in Xcode, where replaying them gives per-kernel performance counters
+      and per-line costs. Requires `METAL_CAPTURE_ENABLED=1` in the environment when Julia
+      starts.
     - `breakdown32`: cost of the components of the integrand of the first tier (geometry,
       Lagrange basis, kernel and accumulation), with a fixed amount of work per pair
     - `rule32`, `rule32_fields`: reproducer of a crash of the CPU backend on x86, when a large
@@ -265,6 +270,27 @@ function check_profile()
     return
 end
 
+function check_capture()
+    BACKEND_NAME == "metal" || error("the capture32 stage requires INTI_DIAG_BACKEND=metal")
+    backend = gpu_backend()
+    h = 0.2
+    Q = sphere_quadrature(; meshsize = h, quads = get(ENV, "INTI_DIAG_QUADS", "0") == "1")
+    X = [(coords = q.coords + s * δ * h * q.normal, normal = q.normal) for q in Q for δ in (1.0e-2, 0.1, 0.5) for s in (-1, 1)]
+    for (name, K) in (("capture_laplace", Inti.SingleLayerKernel(Inti.Laplace(; dim = 3))), ("capture_stokes", Inti.SingleLayerKernel(Inti.Stokes(; μ = 1.0, dim = 3))))
+        plan = Inti.adaptive_correction_plan(K, Q; backend, T = Float32, maxdist = 2h, rtol = 1.0e-5, atol = 1.0e-6)
+        Xd = device_targets(plan, X, backend)
+        keys, npairs = Ext._nearfield_keys(plan, Xd)
+        Ext._nearfield_values(plan, Xd, keys, npairs) # compilation
+        KA.synchronize(backend)
+        path = Metal.@capture name = name begin
+            Ext._nearfield_values(plan, Xd, keys, npairs)
+            KA.synchronize(backend)
+        end
+        say("  ", nameof(typeof(K.op)), ": $npairs pairs, trace written to ", path)
+    end
+    return
+end
+
 ## 3b. cost breakdown of the integrand: every pair applies the rule on the reference element and
 ## on its children (a fixed number of evaluations), with the integrand reduced to the geometry
 ## (element and jacobian), the geometry and the Lagrange basis, or the full integrand
@@ -425,6 +451,8 @@ elseif stage == "pocl32"
     check_correction(CPU(), Float32)
 elseif stage == "profile32"
     check_profile()
+elseif stage == "capture32"
+    check_capture()
 elseif stage == "breakdown32"
     check_breakdown()
 elseif stage == "rule32"
