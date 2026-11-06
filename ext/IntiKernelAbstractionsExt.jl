@@ -1031,7 +1031,10 @@ If `cooperative` (the default on GPUs), each pair is integrated by a workgroup o
 work-items (see `_coop_integrate!`) instead of a single work-item, with the same arithmetic.
 The CPU backend executes the work-items of a workgroup sequentially, so that the per-thread
 integration is preferable there. `cooperative_first` (by default, `cooperative`) makes this
-choice for the first tier only.
+choice for the first tier only. (On the 3D benchmark, a per-thread first tier is faster on CUDA
+GPUs for narrow integrands, e.g. Laplace, by 1.04-1.7× on the RTX A6000 and H100, and slower
+for Stokes; on an Apple M3 the cooperative first tier is faster for all integrands. The default
+is the same on all GPUs, for simplicity.)
 
 If `sort_by_cost`, the pairs of the first tier are processed in the order given by
 [`_cost_order`](@ref). This is the default on GPUs, where it reduces the divergence between
@@ -1216,7 +1219,7 @@ function LinearAlgebra.mul!(y::AbstractVector, A::DeviceSparseMatrixCSR, x::Abst
     size(A, 2) == length(x) || throw(DimensionMismatch("A has $(size(A, 2)) columns, x has length $(length(x))"))
     size(A, 1) == length(y) || throw(DimensionMismatch("A has $(size(A, 1)) rows, y has length $(length(y))"))
     size(A, 1) == 0 && return y
-    return _csr_mul!(y, A, x, α, β, _mul_lanes(A), 128)
+    return _csr_mul!(y, A, x, α, β, _mul_lanes(A), 64)
 end
 
 function _csr_mul!(y, A::DeviceSparseMatrixCSR, x, α, β, L, W)
