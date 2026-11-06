@@ -20,17 +20,25 @@
       Lagrange basis, kernel and accumulation), with a fixed amount of work per pair
     - `rule32`, `rule32_fields`: reproducer of a crash of the CPU backend on x86, when a large
       struct is passed as a kernel argument (`rule32` is expected to crash there)
+    - `tiers`: on the problem of `benchmark/adaptive_correction_ka.jl` (ellipsoid, triangles,
+      `INTI_DIAG_H`, default 0.1), time of the integration with the first tier cooperative or
+      per-thread (with two memory budgets), and of the application of the correction with one
+      or several work-items per row; checks that the variants agree
+    - `mul`: application of the correction (same problem) with `L` work-items per row and
+      workgroups of `W` work-items
     Each stage prints a line before starting, so that a crash can be located. For the
     correction stages, the following environment variables can be set:
     - `INTI_DIAG_DIM=2`: ellipse (line elements) instead of a sphere
     - `INTI_DIAG_QUADS=1`: quadrilaterals instead of triangles (3D)
     - `INTI_DIAG_COOP=0|1`: cooperative integration (default: on GPUs)
+    - `INTI_DIAG_COOP_FIRST=0|1`: cooperative integration in the first tier (default: same as
+      `INTI_DIAG_COOP`)
     - `INTI_DIAG_PRIVATE_BYTES=n`, `INTI_DIAG_SHARED_BYTES=n`: memory budget of the first tier,
       per thread or in shared memory (cooperative integration)
     - `INTI_DIAG_SORT=0|1`: process the pairs sorted by cost (default: on GPUs only)
 =#
 
-using Inti, KernelAbstractions, AcceleratedKernels, ImplicitBVH, Gmsh, StaticArrays, SparseArrays, LinearAlgebra, Printf
+using Inti, KernelAbstractions, AcceleratedKernels, ImplicitBVH, Gmsh, StaticArrays, SparseArrays, LinearAlgebra, Printf, Random
 const KA = KernelAbstractions
 const Ext = Base.get_extension(Inti, :IntiKernelAbstractionsExt)
 
@@ -60,6 +68,8 @@ elseif BACKEND_NAME == "metal"
             return String(take!(io))
         end
         gpu_profile(f) = Metal.@profile trace = true f()
+        # (defined here: the macro is expanded when the function is defined, which requires Metal)
+        gpu_capture(f, name) = Metal.@capture name = name f()
     end
 else
     error("unknown INTI_DIAG_BACKEND = $BACKEND_NAME")
@@ -158,15 +168,17 @@ end
 function values_options(backend)
     gpu = !(backend isa typeof(CPU()))
     flag(name, default) = haskey(ENV, name) ? ENV[name] == "1" : default
+    cooperative = flag("INTI_DIAG_COOP", gpu)
     return (;
-        cooperative = flag("INTI_DIAG_COOP", gpu),
+        cooperative,
+        cooperative_first = flag("INTI_DIAG_COOP_FIRST", cooperative),
         sort_by_cost = flag("INTI_DIAG_SORT", gpu),
         private_bytes = parse(Int, get(ENV, "INTI_DIAG_PRIVATE_BYTES", string(Ext.PRIVATE_BYTES))),
         shared_bytes = parse(Int, get(ENV, "INTI_DIAG_SHARED_BYTES", string(Ext.SHARED_BYTES))),
     )
 end
 
-tiers(plan, IT, vkw) = Ext._tiers(plan, IT; vkw.cooperative, vkw.private_bytes, vkw.shared_bytes)
+tiers(plan, IT, vkw) = Ext._tiers(plan, IT; cooperative = vkw.cooperative_first, vkw.private_bytes, vkw.shared_bytes)
 
 function check_correction(backend, T)
     dim, quads, h, Q, X = geometry()
@@ -296,7 +308,7 @@ function check_capture()
         keys, npairs = Ext._nearfield_keys(plan, Xd)
         Ext._nearfield_values(plan, Xd, keys, npairs) # compilation
         KA.synchronize(backend)
-        path = Metal.@capture name = name begin
+        path = gpu_capture(name) do
             Ext._nearfield_values(plan, Xd, keys, npairs)
             KA.synchronize(backend)
         end
@@ -453,6 +465,135 @@ function check_rule(fields)
     return say("  ok, sum = ", sum(out))
 end
 
+## 5. first tier cooperative or per-thread, and application of the correction, on the problem of
+## `benchmark/adaptive_correction_ka.jl`
+
+function ellipsoid_quadrature(; meshsize, order = 2, qorder = 4)
+    Inti.clear_entities!()
+    msh = try
+        gmsh.initialize(String[], false)
+        gmsh.option.setNumber("General.Verbosity", 2)
+        gmsh.option.setNumber("Mesh.MeshSizeMax", meshsize)
+        gmsh.option.setNumber("Mesh.MeshSizeMin", meshsize)
+        gmsh.model.occ.addSphere(0, 0, 0, 1)
+        gmsh.model.occ.dilate([(3, 1)], 0, 0, 0, 1, 0.8, 0.6)
+        gmsh.model.occ.synchronize()
+        gmsh.model.mesh.generate(2)
+        gmsh.model.mesh.set_order(order)
+        Inti.import_mesh(; dim = 3)
+    finally
+        gmsh.finalize()
+    end
+    Γ = Inti.Domain(e -> Inti.geometric_dimension(e) == 2, msh)
+    return Inti.Quadrature(msh[Γ]; qorder)
+end
+
+function near_targets(Q::Inti.Quadrature{N}, h; rng = MersenneTwister(0)) where {N}
+    X = NamedTuple{(:coords, :normal), Tuple{SVector{N, Float64}, SVector{N, Float64}}}[]
+    for q in Q, side in (-1, 1)
+        d = h * 10^(-2 * rand(rng))
+        push!(X, (coords = q.coords + side * d * q.normal, normal = q.normal))
+    end
+    return X
+end
+
+function check_tiers()
+    backend = gpu_backend()
+    sync() = KA.synchronize(backend)
+    besttime(f, n) = (f(); sync(); minimum(_ -> @elapsed((f(); sync())), 1:n))
+    h = parse(Float64, get(ENV, "INTI_DIAG_H", "0.1"))
+    Q = ellipsoid_quadrature(; meshsize = h)
+    X = near_targets(Q, h)
+    maxdist = 2h
+    variants = (
+        "coop" => (; cooperative_first = true),
+        "thread 4096" => (; cooperative_first = false, private_bytes = 4096),
+        "thread 1024" => (; cooperative_first = false, private_bytes = 1024),
+    )
+    cases = [(T, rtol) for T in (Float32, Float64) for rtol in (1.0e-5, 1.0e-6) if (T == Float32 ? rtol ≥ 1.0e-5 : KA.supports_float64(backend))]
+    laplace, stokes = Inti.Laplace(; dim = 3), Inti.Stokes(; μ = 1.0, dim = 3)
+    kernels = (
+        "Laplace SL" => Inti.SingleLayerKernel(laplace), "Laplace DL" => Inti.DoubleLayerKernel(laplace),
+        "Stokes SL" => Inti.SingleLayerKernel(stokes), "Stokes DL" => Inti.DoubleLayerKernel(stokes),
+    )
+    say("  h = $h: $(length(Q)) sources, $(length(X)) targets")
+    say("  integration (ms, minimum of 3) with the first tier cooperative or per-thread (memory budget in bytes) [first tier capacity];")
+    say("  max relative difference of the entries and number of pairs with a different number of subdivisions, vs coop")
+    say("  application (ms, minimum of 20) with one work-item per row (old) and with the default (L work-items per row), effective bandwidth")
+    for (kname, K) in kernels, (T, rtol) in cases
+        # atol as in the benchmark, relative to the largest entry
+        plan0 = Inti.adaptive_correction_plan(K, Q; backend, T, maxdist, rtol = 1.0e-4, atol = 0.0)
+        X0 = device_targets(plan0, X, backend)
+        keys0, npairs0 = Ext._nearfield_keys(plan0, X0)
+        scale = maximum(norm, Array(Ext._nearfield_values(plan0, X0, keys0, npairs0)[2]))
+        plan = Inti.adaptive_correction_plan(K, Q; backend, T, maxdist, rtol, atol = 0.1 * rtol * scale)
+        Xd = device_targets(plan, X, backend)
+        keys, npairs = Ext._nearfield_keys(plan, Xd)
+        np = size(plan.el2qtags, 1)
+        line = @sprintf("  %-10s %s rtol=%.0e %7d pairs |", kname, T == Float32 ? "F32" : "F64", rtol, npairs)
+        v0, n0 = nothing, nothing
+        for (vname, vkw) in variants
+            _, v, n = Ext._nearfield_values(plan, Xd, keys, npairs; vkw...)
+            v, n = Array(v), Array(n)
+            t = besttime(() -> Ext._nearfield_values(plan, Xd, keys, npairs; vkw...), 3)
+            cap = Ext._tiers(plan, SVector{np, eltype(v)}; cooperative = vkw.cooperative_first, private_bytes = get(vkw, :private_bytes, Ext.PRIVATE_BYTES))[1]
+            line *= @sprintf(" %s %7.2f [%d]", vname, 1.0e3 * t, cap)
+            if isnothing(v0)
+                v0, n0 = v, n
+                line *= @sprintf(" (nsub %.2f) |", sum(abs, n) / length(n))
+            else
+                line *= @sprintf(" (%.0e, %d) |", maximum(norm, v - v0) / maximum(norm, v0), count(n .!= n0))
+            end
+        end
+        δ = Inti.adaptive_correction(plan, Xd)
+        V = eltype(δ) <: SMatrix ? SVector{3, T} : T
+        σ = Ext._to_device(backend, rand(V, length(Q)))
+        y1 = KA.allocate(backend, Base.promote_op(*, eltype(δ), V), size(δ, 1))
+        y2 = similar(y1)
+        t1 = besttime(() -> Ext._csr_mul!(y1, δ, σ, true, false, 1, 128), 20)
+        t2 = besttime(() -> mul!(y2, δ, σ), 20)
+        bytes = nnz(δ) * (sizeof(eltype(δ)) + sizeof(eltype(δ.colval)))
+        err = maximum(norm, Array(y2) - Array(y1)) / maximum(norm, Array(y1))
+        line *= @sprintf(" mul old %.3f (%.0f GB/s), L=%d %.3f (%.0f GB/s), diff %.0e", 1.0e3 * t1, bytes / t1 / 1.0e9, Ext._mul_lanes(δ), 1.0e3 * t2, bytes / t2 / 1.0e9, err)
+        say(line)
+    end
+    return
+end
+
+@kernel noop_kernel!(y) = (i = @index(Global); nothing)
+
+# application of the correction (problem of `check_tiers`, Float32 and, if supported, Float64)
+# with `L` work-items per row and workgroups of `W` work-items
+function check_mul()
+    backend = gpu_backend()
+    sync() = KA.synchronize(backend)
+    besttime(f, n) = (f(); sync(); minimum(_ -> @elapsed((f(); sync())), 1:n))
+    y0 = KA.zeros(backend, Float32, 1)
+    @printf("  empty kernel (launch and synchronization): %.3f ms\n", 1.0e3 * besttime(() -> noop_kernel!(backend)(y0; ndrange = 1), 50))
+    h = parse(Float64, get(ENV, "INTI_DIAG_H", "0.1"))
+    Q = ellipsoid_quadrature(; meshsize = h)
+    X = near_targets(Q, h)
+    for K in (Inti.SingleLayerKernel(Inti.Laplace(; dim = 3)), Inti.SingleLayerKernel(Inti.Stokes(; μ = 1.0, dim = 3))), T in (Float32, Float64)
+        T == Float64 && !KA.supports_float64(backend) && continue
+        plan = Inti.adaptive_correction_plan(K, Q; backend, T, maxdist = 2h, rtol = 1.0e-5, atol = 1.0e-6)
+        δ = Inti.adaptive_correction(plan, device_targets(plan, X, backend))
+        V = eltype(δ) <: SMatrix ? SVector{3, T} : T
+        σ = Ext._to_device(backend, rand(V, length(Q)))
+        y = KA.allocate(backend, Base.promote_op(*, eltype(δ), V), size(δ, 1))
+        bytes = nnz(δ) * (sizeof(eltype(δ)) + sizeof(eltype(δ.colval)))
+        @printf("  %s %s: %d rows, %.1f entries per row, %.1f MB, default L = %d\n", nameof(typeof(K.op)), T, size(δ, 1), nnz(δ) / size(δ, 1), bytes / 1.0e6, Ext._mul_lanes(δ))
+        for W in (64, 128, 256)
+            line = @sprintf("    W = %3d:", W)
+            for L in (1, 4, 8, 16, 32)
+                t = besttime(() -> Ext._csr_mul!(y, δ, σ, true, false, L, W), 20)
+                line *= @sprintf("  L = %2d %.3f ms (%4.0f GB/s)", L, 1.0e3 * t, bytes / t / 1.0e9)
+            end
+            say(line)
+        end
+    end
+    return
+end
+
 if stage == "kernels"
     check_kernels()
 elseif stage == "gpu64"
@@ -473,6 +614,10 @@ elseif stage == "rule32"
     check_rule(false)
 elseif stage == "rule32_fields"
     check_rule(true)
+elseif stage == "tiers"
+    check_tiers()
+elseif stage == "mul"
+    check_mul()
 else
     error("unknown stage $stage")
 end

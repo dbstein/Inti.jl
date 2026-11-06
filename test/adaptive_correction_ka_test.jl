@@ -231,6 +231,16 @@ end
     y = rand(length(Xd))
     @test δ * σ ≈ δh * σ
     @test mul!(copy(y), δ, σ, 2.0, -0.5) ≈ 2.0 * (δh * σ) - 0.5 * y
+    # several work-items per row (the default on GPUs): fewer and more (32) than the entries of
+    # a row, and a number of rows (first rows of `δ`) that is not a multiple of the 4 rows per
+    # workgroup
+    @test maximum(diff(rowptr)) < 32
+    m′ = 4 * (size(δ, 1) ÷ 4) - 1
+    δ′ = Ext.DeviceSparseMatrixCSR(m′, size(δ, 2), δ.rowptr[1:(m′ + 1)], δ.colval, δ.nzval)
+    for (L, W) in ((4, 16), (32, 128))
+        @test Ext._csr_mul!(similar(y, m′), δ′, σ, true, false, L, W) ≈ δh[1:m′, :] * σ
+        @test Ext._csr_mul!(y[1:m′], δ′, σ, 2.0, -0.5, L, W) ≈ 2.0 * (δh[1:m′, :] * σ) - 0.5 * y[1:m′]
+    end
     # targets without normals (the single layer kernel does not need them), and reuse of
     # the plan for a different set of targets
     Xs = [x.coords for x in offsurface_targets(Q, h, (0.05, 0.3), 1)]
@@ -244,6 +254,7 @@ end
     @test eltype(δ) == SMatrix{2, 2, Float32, 4}
     σ = rand(SVector{2, Float32}, length(Q))
     @test δ * σ ≈ SparseMatrixCSC(δ) * σ
+    @test Ext._csr_mul!(similar(σ, size(δ, 1)), δ, σ, true, false, 4, 16) ≈ SparseMatrixCSC(δ) * σ
     # singular interactions are detected relative to the rounding errors of the targets: with
     # Float64 targets, a target at distance 1e-6 (≈ 8 eps(Float32) |x|) from a node is nearly
     # singular even when T = Float32, while a target on a node is singular
@@ -287,6 +298,11 @@ end
         @test c1 == c0
         @test maximum(norm, v1 - v0) ≤ 1.0e-7 * maximum(norm, v0)
         @test count(n1 .!= n0) ≤ length(n0) ÷ 100
+        # per-thread first tier, cooperative later tiers
+        c2, v2, n2 = Ext._nearfield_values(plan64, Xc, keys, npairs; cooperative = true, cooperative_first = false, group_size = G, private_bytes = 0, scratch_bytes = 2^16)
+        @test c2 == c0
+        @test maximum(norm, v2 - v0) ≤ 1.0e-7 * maximum(norm, v0)
+        @test count(n2 .!= n0) ≤ length(n0) ÷ 100
     end
     # targets far away: empty correction
     δ0 = Inti.adaptive_correction(plan, [(coords = SVector(10.0, 10.0), normal = SVector(1.0, 0.0))])

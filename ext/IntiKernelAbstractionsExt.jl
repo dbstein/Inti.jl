@@ -1021,7 +1021,7 @@ function _failed_pairs(backend, list, nsub, n)
 end
 
 """
-    _nearfield_values(plan, X, keys, npairs; sort_by_cost, cooperative, group_size, private_bytes, shared_bytes, scratch_bytes)
+    _nearfield_values(plan, X, keys, npairs; sort_by_cost, cooperative, cooperative_first, group_size, private_bytes, shared_bytes, scratch_bytes)
 
 Compute the values (and column indices) of the CSR correction matrix, together with the
 number of subdivisions used for each pair. The adaptive integration is performed in tiers of
@@ -1030,7 +1030,8 @@ increasing capacity, see [`_tiers`](@ref).
 If `cooperative` (the default on GPUs), each pair is integrated by a workgroup of `group_size`
 work-items (see `_coop_integrate!`) instead of a single work-item, with the same arithmetic.
 The CPU backend executes the work-items of a workgroup sequentially, so that the per-thread
-integration is preferable there.
+integration is preferable there. `cooperative_first` (by default, `cooperative`) makes this
+choice for the first tier only.
 
 If `sort_by_cost`, the pairs of the first tier are processed in the order given by
 [`_cost_order`](@ref). This is the default on GPUs, where it reduces the divergence between
@@ -1040,8 +1041,9 @@ target and neighboring elements are adjacent) is more cache-friendly.
 function _nearfield_values(
         plan::AdaptiveCorrectionPlan, X, keys, npairs;
         sort_by_cost = !(plan.backend isa typeof(KA.CPU())),
-        cooperative = !(plan.backend isa typeof(KA.CPU())), group_size = 32,
-        private_bytes = PRIVATE_BYTES, shared_bytes = SHARED_BYTES, scratch_bytes = SCRATCH_BYTES,
+        cooperative = !(plan.backend isa typeof(KA.CPU())), cooperative_first = cooperative,
+        group_size = 32, private_bytes = PRIVATE_BYTES, shared_bytes = SHARED_BYTES,
+        scratch_bytes = SCRATCH_BYTES,
     )
     backend = plan.backend
     np = size(plan.el2qtags, 1)
@@ -1057,12 +1059,12 @@ function _nearfield_values(
         keys, X, plan.els, plan.offsets, plan.oris, plan.ynodes, plan.wnodes, plan.el2qtags,
         plan.kernel, plan.basis, _rule_fields(plan.rule)..., plan.rtol, plan.atol,
     )
-    caps = _tiers(plan, IT; cooperative, private_bytes, shared_bytes)
+    caps = _tiers(plan, IT; cooperative = cooperative_first, private_bytes, shared_bytes)
     DOM = typeof(plan.rule.domain)
     G = group_size
     list = sort_by_cost ? _cost_order(plan, X, keys, npairs) : nothing
     # first tier: all pairs, panels in shared memory (cooperative) or per-thread storage
-    if cooperative
+    if cooperative_first
         _correction_coop_kernel!(backend, G)(
             nzval, colval, nsub, list, args..., caps[1], Val(G), Val(_capacity(DOM, caps[1])),
             Val(VT), Val(np); ndrange = npairs * G,
@@ -1172,23 +1174,56 @@ function Base.show(io::IO, A::DeviceSparseMatrixCSR)
     )
 end
 
-@kernel function _csr_mul_kernel!(y, @Const(rowptr), @Const(colval), @Const(nzval), @Const(x), α, β)
-    i = @index(Global, Linear)
-    @inbounds begin
-        acc = zero(eltype(y))
-        for k in rowptr[i]:(rowptr[i + 1] - 1)
+# `y = α A x + β y`, with `L` work-items per row (a power of 2) and `W ÷ L` rows per workgroup of
+# `W` work-items. The work-items of a row accumulate every `L`-th entry (so that consecutive
+# work-items read consecutive entries), and their partial sums are added by a tree reduction.
+@kernel function _csr_mul_kernel!(
+        y, @Const(rowptr), @Const(colval), @Const(nzval), @Const(x), α, β, ::Val{L}, ::Val{W},
+    ) where {L, W}
+    g = @index(Group, Linear)
+    t = @index(Local, Linear)
+    s = KA.@localmem eltype(y) (W,)
+    l = (t - 1) % L + 1
+    i = (g - 1) * (W ÷ L) + (t - 1) ÷ L + 1
+    acc = zero(eltype(y))
+    if i ≤ length(y)
+        @inbounds for k in (rowptr[i] + l - 1):L:(rowptr[i + 1] - 1)
             acc += nzval[k] * x[colval[k]]
         end
-        y[i] = iszero(β) ? α * acc : α * acc + β * y[i]
     end
+    @inbounds s[t] = acc
+    h = L ÷ 2
+    while h ≥ 1
+        KA.@synchronize
+        if l ≤ h
+            @inbounds s[t] += s[t + h]
+        end
+        h ÷= 2
+    end
+    if l == 1 && i ≤ length(y)
+        @inbounds y[i] = iszero(β) ? α * s[t] : α * s[t] + β * y[i]
+    end
+end
+
+# work-items per row: one on the CPU backend; on GPUs, about the mean number of entries per row
+# (a power of 2, at most 32)
+function _mul_lanes(A::DeviceSparseMatrixCSR)
+    KA.get_backend(A) isa typeof(KA.CPU()) && return 1
+    return clamp(prevpow(2, max(1, nnz(A) ÷ max(1, size(A, 1)))), 1, 32)
 end
 
 function LinearAlgebra.mul!(y::AbstractVector, A::DeviceSparseMatrixCSR, x::AbstractVector, α::Number, β::Number)
     size(A, 2) == length(x) || throw(DimensionMismatch("A has $(size(A, 2)) columns, x has length $(length(x))"))
     size(A, 1) == length(y) || throw(DimensionMismatch("A has $(size(A, 1)) rows, y has length $(length(y))"))
-    backend = KA.get_backend(A)
     size(A, 1) == 0 && return y
-    _csr_mul_kernel!(backend)(y, A.rowptr, A.colval, A.nzval, x, α, β; ndrange = size(A, 1))
+    return _csr_mul!(y, A, x, α, β, _mul_lanes(A), 128)
+end
+
+function _csr_mul!(y, A::DeviceSparseMatrixCSR, x, α, β, L, W)
+    _csr_mul_kernel!(KA.get_backend(A), W)(
+        y, A.rowptr, A.colval, A.nzval, x, α, β, Val(L), Val(W);
+        ndrange = cld(size(A, 1), W ÷ L) * W,
+    )
     return y
 end
 
