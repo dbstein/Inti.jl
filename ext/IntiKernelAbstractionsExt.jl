@@ -2,6 +2,8 @@ module IntiKernelAbstractionsExt
 
 import Inti
 import KernelAbstractions as KA
+# Kept as a dependency: GPUArrays implements Base's sort!, accumulate! and mapreduce for GPU
+# arrays with AcceleratedKernels, and ImplicitBVH depends on it.
 import AcceleratedKernels as AK
 import ImplicitBVH
 using KernelAbstractions: @kernel, @index, @Const
